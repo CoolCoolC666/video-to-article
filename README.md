@@ -202,7 +202,7 @@ python packaging/make_models_funasr_zip.py
 
 ## 本 fork 改动
 
-本 fork ([CoolCoolC666/video-to-article-yilan-enhanced-by-Moonlight](https://github.com/CoolCoolC666/video-to-article-yilan-enhanced-by-Moonlight)) 基于 [DEKVIW/video-to-article](https://github.com/DEKVIW/video-to-article) v0.4.5，针对本地 **NVIDIA 加速 Qwen3-ASR 转写** 做了以下增强。
+本 fork ([CoolCoolC666/video-to-article](https://github.com/CoolCoolC666/video-to-article)) 基于 [DEKVIW/video-to-article](https://github.com/DEKVIW/video-to-article) v0.4.5，针对本地 **NVIDIA 加速 Qwen3-ASR 转写** 做了以下增强。
 
 ### Qwen3-ASR 转写
 

@@ -200,6 +200,59 @@ python packaging/make_models_funasr_zip.py
 
 欢迎 Issue / PR。较大改动建议先开 Issue。提交前请确认未包含 API Key、`config.json`、个人音视频与 `dist/`。
 
+## 本 fork 改动
+
+本 fork ([CoolCoolC666/video-to-article-yilan-enhanced-by-Moonlight](https://github.com/CoolCoolC666/video-to-article-yilan-enhanced-by-Moonlight)) 基于 [DEKVIW/video-to-article](https://github.com/DEKVIW/video-to-article) v0.4.5，针对本地 **NVIDIA 加速 Qwen3-ASR 转写** 做了以下增强。
+
+### Qwen3-ASR 转写
+
+| 改动 | 内容 | 为什么改 |
+|------|------|----------|
+| **Device fallback** | `auto` / `cuda` / `cpu` 三档 GUI 暴露<br>`auto` = CUDA 可用走 `cuda:0` + `max_memory={0: "7GiB"}` 限显存（适配 12GB 显卡防 OOM），不可用静默降级 CPU<br>`cuda` = 强制 CUDA；不可用时显式报错（不静默降级，避免以为跑 GPU 实际跑 CPU）<br>`cpu` = 强制 CPU（NVIDIA 驱动故障 / GPU 满载 / 远程控制等场景） | 上游默认 `device_map="auto"` 12GB 显卡跑 1.7B 模型必 OOM；显式 `max_memory` 才能稳跑 |
+| **Language 白名单** | Qwen3-ASR 0.0.6 API 仅支持 30 种语言，`Auto` 必报 `Unsupported language`<br>GUI 暴露 4 种：Chinese / English / Japanese / Korean<br>用户填非法值时自动降级 `Chinese` + WARNING 日志<br>**不能**传 `Chinese+English` 混合（Qwen3-ASR API 强制单语种） | 上游 GUI 的「Auto / 中文 / English」会撞 Unsupported language 报错 |
+| **手动「释放 ASR 模型」按钮** | 转写完成后 PyTorch 默认不释放显存，GPU 仍占 3-4GB<br>按钮一键释放（`del model + torch.cuda.empty_cache()`）<br>状态 label 5s 刷新：蓝/灰 显示当前加载的 model_id | 转写完跑 SD / 玩显卡游戏经常撞显存墙 |
+| **「清理临时缓存」按钮** | 转写时产生的 ASR 音频分片（`%TEMP%\qwen_asr_chunks_*`）一键清理 + 显示腾出 MB | 长视频分片缓存可达 GB 级 |
+
+**配置位置**：「设置 → 转写 → Qwen3-ASR 高级」GroupBox。CLI 用 `--qwen-device` 参数。
+
+### LLM / GUI 通用
+
+| 改动 | 内容 | 为什么改 |
+|------|------|----------|
+| **LLM `max_tokens` 扩到 1,000,000** | 上游默认 12,000 对长视频转写 + 长成稿模板不够<br>GUI `setRange(256, 1_000_000)` + tooltip 解释 | 长视频转写文本可达 100K+ 字符 + 提示词模板 5K 字符 + 成稿 50K 字符，12K 必截断 |
+| **「转写」Tab GUI 化** | `qwen_asr` 5 字段（`model_id` / `context_file` / `hf_home` / `language` / `device`）原本只在 `config.json` 写<br>全部暴露在「设置 → 转写」+ 文件浏览按钮 | 改一次要手动编辑 JSON，错误率高 |
+
+### 健壮性
+
+- **`closeEvent` 强等 worker**：上游关闭 GUI 时 worker 线程不一定退出，可能卡死
+  - 本 fork：`thread.wait(10000)` + `terminate()` 兜底
+- **`atexit` 兜底清理 tempdir**：进程任何路径退出（GUI 关闭 / 异常 / kill）都会清理 `%TEMP%\qwen_asr_chunks_*`
+
+### 测试 / 工程
+
+- **6 个 smoke 脚本移到 `tests/`**（`smoke_settings / fallback / language / jp_kr / release / cleanup`）
+  - 验证 GUI 字段读写、device fallback、language 兜底、释放按钮、清理按钮
+  - 6 套全过，共 16+ 断言
+  - `tests/README.md` 说明运行方式（从仓库根跑）
+- **`.gitignore` 加严**：
+  - 新增 `pip-unpack-*/` `run_e2e_main.log` `__tmp_*` `*.bak` `config.json.bak*`
+  - 一次性 fork 脚本（`fix_*.py` `switch_*.py` `strip_*.py` `run_qwen_asr.py` `transcribe.py`）默认不入仓
+- **`config.example.json` 模板占位**：`api_key="your-api-key-here"`，新用户 fork 后改 `config.json` 时不会误以为已经是占位
+
+### 通用改进候选（可考虑回提上游 PR）
+
+下列改动不依赖 fork-specific 场景，对所有 NVIDIA 用户 / 长视频用户都受益，可以拆 PR：
+
+1. **Qwen3-ASR device fallback** — 任何 NVIDIA 显卡用户受益（不限 12GB）
+2. **Qwen3-ASR language 白名单** — 上游用户也会踩到 Auto 报错
+3. **LLM max_tokens 1M** — 上游默认 12K 太小，长视频必截断
+4. **GUI 字段暴露**（5 字段从 config.json 提升到 GUI）— 降低使用门槛
+
+### Fork-specific（不打算回上游）
+
+- 中文 README 风格的本章节（上游 README 是中文，但不希望 PR 改 README）
+- 兼容含 `~` 的 Windows 路径（`E:\000~\YilanChengWen-src`）
+
 ## License
 
 [MIT License](./LICENSE) © 2026 一览成文 YilanChengWen contributor(s)

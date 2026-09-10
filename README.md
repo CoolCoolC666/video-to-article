@@ -202,15 +202,19 @@ python packaging/make_models_funasr_zip.py
 
 ## 本 fork 改动
 
-本 fork ([CoolCoolC666/video-to-article](https://github.com/CoolCoolC666/video-to-article)) 基于 [DEKVIW/video-to-article](https://github.com/DEKVIW/video-to-article) v0.4.5，针对本地 **NVIDIA 加速 Qwen3-ASR 转写** 做了以下增强。
+本 fork ([CoolCoolC666/video-to-article](https://github.com/CoolCoolC666/video-to-article)) 基于 [DEKVIW/video-to-article](https://github.com/DEKVIW/video-to-article) v0.4.5，从零**新增 Qwen3-ASR 引擎支持**（DEKVIW 上游仅有 FunASR / Whisper）并围绕它做了一系列增强。
 
-### Qwen3-ASR 转写
+### 新增：Qwen3-ASR 引擎
+
+上游 `src/video_to_article/media/` 目录只有 `__init__.py` / `audio.py` / `download.py` / `ffmpeg_tools.py` / `thumbnails.py`，**没有**任何 Qwen3-ASR 相关代码。fork **新增** `src/video_to_article/media/qwen_asr.py`（~520 行），提供 `transcribe_audio_with_qwen_asr()` 接口，与现有 `funasr` 引擎并列。
+
+### Qwen3-ASR 引擎的健壮性增强
 
 | 改动 | 内容 | 为什么改 |
 |------|------|----------|
 | **长视频自动切片** | 音频 > **7.5 分钟**（`CHUNK_THRESHOLD_SEC`）自动切 **5 分钟/段**（`CHUNK_SEGMENT_SEC`）<br>ffmpeg 切到 `%TEMP%\qwen_asr_chunks_xxxx\` 临时目录<br>Qwen3-ASR 逐段转写，最终合并成完整转写结果<br>转写完 / 异常路径 / 进程崩溃均清理（`atexit` 兜底扫 `%TEMP%\qwen_asr_chunks_*`） | Qwen3-ASR 1.7B 对长音频单次推理必 OOM / 截断；分段转写每段都在阈值内更稳<br>上游 DEKVIW 没这功能，长视频直接转写是 1 小时整段发过去 |
-| **Device fallback** | `auto` / `cuda` / `cpu` 三档 GUI 暴露<br>`auto` = CUDA 可用走 `cuda:0` + `max_memory={0: "7GiB"}` 限显存（适配 12GB 显卡防 OOM），不可用静默降级 CPU<br>`cuda` = 强制 CUDA；不可用时显式报错（不静默降级，避免以为跑 GPU 实际跑 CPU）<br>`cpu` = 强制 CPU（NVIDIA 驱动故障 / GPU 满载 / 远程控制等场景） | 上游默认 `device_map="auto"` 12GB 显卡跑 1.7B 模型必 OOM；显式 `max_memory` 才能稳跑 |
-| **Language 白名单** | Qwen3-ASR 0.0.6 API 仅支持 30 种语言，`Auto` 必报 `Unsupported language`<br>GUI 暴露 4 种：Chinese / English / Japanese / Korean<br>用户填非法值时自动降级 `Chinese` + WARNING 日志<br>**不能**传 `Chinese+English` 混合（Qwen3-ASR API 强制单语种） | 上游 GUI 的「Auto / 中文 / English」会撞 Unsupported language 报错 |
+| **Device fallback** | `auto` / `cuda` / `cpu` 三档 GUI 暴露<br>`auto` = CUDA 可用走 `cuda:0` + `max_memory={0: "7GiB"}` 限显存（适配 12GB 显卡防 OOM），不可用静默降级 CPU<br>`cuda` = 强制 CUDA；不可用时显式报错（不静默降级，避免以为跑 GPU 实际跑 CPU）<br>`cpu` = 强制 CPU（NVIDIA 驱动故障 / GPU 满载 / 远程控制等场景） | 默认 `device_map="auto"` 12GB 显卡跑 1.7B 模型必 OOM；显式 `max_memory` 才能稳跑 |
+| **Language 白名单** | Qwen3-ASR 0.0.6 API 仅支持 30 种语言，`Auto` 必报 `Unsupported language`<br>GUI 暴露 4 种：Chinese / English / Japanese / Korean<br>用户填非法值时自动降级 `Chinese` + WARNING 日志<br>**不能**传 `Chinese+English` 混合（Qwen3-ASR API 强制单语种） | GUI 不加白名单兜底，用户填 "Auto" 必撞 Unsupported language 报错 |
 | **手动「释放 ASR 模型」按钮** | 转写完成后 PyTorch 默认不释放显存，GPU 仍占 3-4GB<br>按钮一键释放（`del model + torch.cuda.empty_cache()`）<br>状态 label 5s 刷新：蓝/灰 显示当前加载的 model_id | 转写完跑 SD / 玩显卡游戏经常撞显存墙 |
 | **「清理临时缓存」按钮** | 转写时产生的 ASR 音频分片（`%TEMP%\qwen_asr_chunks_*`）一键清理 + 显示腾出 MB | 长视频分片缓存可达 GB 级 |
 
@@ -221,7 +225,7 @@ python packaging/make_models_funasr_zip.py
 | 改动 | 内容 | 为什么改 |
 |------|------|----------|
 | **LLM `max_tokens` 扩到 1,000,000** | 上游默认 12,000 对长视频转写 + 长成稿模板不够<br>GUI `setRange(256, 1_000_000)` + tooltip 解释 | 长视频转写文本可达 100K+ 字符 + 提示词模板 5K 字符 + 成稿 50K 字符，12K 必截断 |
-| **「转写」Tab GUI 化** | `qwen_asr` 5 字段（`model_id` / `context_file` / `hf_home` / `language` / `device`）原本只在 `config.json` 写<br>全部暴露在「设置 → 转写」+ 文件浏览按钮 | 改一次要手动编辑 JSON，错误率高 |
+| **「转写」Tab GUI 化** | Qwen3-ASR 5 字段（`model_id` / `context_file` / `hf_home` / `language` / `device`）直接暴露在「设置 → 转写 → Qwen3-ASR 高级」GroupBox + 文件浏览按钮 | 改一次不用手动编辑 JSON，错误率低 |
 
 ### 健壮性
 

@@ -1,0 +1,90 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+src/*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 本地文档不入库（含操作备忘，仅本机保留）
+docs/
+
+# 项目配置和数据（含密钥 / 用户数据）
+config.json
+config - *.json
+config-*.json
+!config.example.json
+data/
+models/
+output/
+logs/
+*.mp3
+*.mp4
+*.wav
+*.m4a
+*.webm
+*.mkv
+
+# Bundled FFmpeg binaries are large; do not commit
+ffmpeg/*.exe
+ffmpeg/ffprobe.exe
+
+# 本地杂项 / 草稿
+cook-search-live.xml
+cook_static_preview.js
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 环境变量
+.env
+.env.local
+
+# 本地工具残留
+pip-unpack-*/
+run_e2e_main.log
+# 临时 ASR 分片缓存（运行期产物，atexit 兜底）
+# 若想把诊断快照入仓请手动 cp 后单独 add
+# 注：smoke 脚本在 tests/ 下，是有效测试代码，**不**忽略
+
+# 临时调试文件（__tmp_*）和备份文件
+__tmp_*
+*.bak
+config.json.bak*
+# 一次性 fork 改造脚本（个人用，不入公共 fork）
+# 如需保留请手动 git add -f
+fix_*.py
+switch_*.py
+strip_*.py
+run_qwen_asr.py
+transcribe.py

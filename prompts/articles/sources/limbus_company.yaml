@@ -74,11 +74,13 @@ sources:
     language: zh
     verified: true
     verified_by: "user-provided 2026-09-12"
-    trust: 0.8
+    trust: 0.5
     notes: |
       B 站官方 wiki 系统（biligame）下的 Limbus Company 子站。
       用户 2026-09-12 主动提供。
-      中文资料，覆盖日常 / 角色 / 攻略。
+      **⚠️ 用户 2026-09-12 订正：已于 2023-08 左右停止更新**
+      HTTP 探测 2026-09-12 仍 200（页面在，没 404），但内容**严重过时**。
+      trust 0.8 → 0.5，仅作"历史资料"参考，主推荐改 wiki.gg / Fandom / 灰机。
 
   # ============ 英文社区 Wiki（用户 2026-09-12 提供，verified）============
   - url: https://limbuscompany.fandom.com/wiki/Limbus_Company_Wiki

@@ -1,3 +1,4 @@
+import re
 import time
 from typing import Optional
 
@@ -6,6 +7,21 @@ from ..prompts import load_prompt
 from ..text_utils import format_time
 
 logger = configure_logging()
+
+# 2026-09-12: 剥离推理模型（M3 / DeepSeek-R1 / o1 等）输出开头的 <think>...</think> 思维链块
+# 规则：只处理开头首个块（含前后空白），不破坏正文
+_THINK_BLOCK_RE = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL)
+
+
+def _strip_thinking_block(text: str) -> str:
+    """剥离输出开头的 <think>...</think> 思维链块（推理模型会暴露给用户）。
+
+    适用模型：MiniMax-M3、DeepSeek-R1、OpenAI o1 / o3 等带推理链的模型。
+    对非推理模型无副作用（regex 不命中直接返回原文）。
+    """
+    if not text:
+        return text
+    return _THINK_BLOCK_RE.sub("", text, count=1)
 
 
 def _render_prompt(prompt_template: str, text: str) -> str:
@@ -89,6 +105,12 @@ def _optimize_with_openai(text: str, config: dict, prompt_name: str) -> Optional
             logger.error("API 返回了 HTML 页面而不是文本内容")
             return None
 
+        # 2026-09-12: 剥离开头的 <think>...</think> 思维链（M3 / DeepSeek-R1 等推理模型）
+        optimized_text = _strip_thinking_block(optimized_text)
+        if not optimized_text:
+            logger.error("API 返回内容在剥离 thinking 块后为空")
+            return None
+
         logger.info(f"文本优化完成 (耗时: {format_time(time.time() - start_time)})")
         return optimized_text
 
@@ -123,5 +145,7 @@ def _optimize_with_anthropic(text: str, config: dict, prompt_name: str) -> Optio
     )
 
     optimized_text = response.content[0].text
+    # 2026-09-12: 剥离开头的 <think>...</think> 思维链（M3 / DeepSeek-R1 等推理模型）
+    optimized_text = _strip_thinking_block(optimized_text)
     logger.info(f"文本优化完成 (耗时: {format_time(time.time() - start_time)})")
     return optimized_text

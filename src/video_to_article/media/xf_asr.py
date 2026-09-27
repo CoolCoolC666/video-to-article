@@ -216,21 +216,23 @@ atexit.register(_cleanup_orphaned_chunks_on_exit)
 # ============ 签名 + API 调用 ============
 
 def _sign_request(app_id: str, secret_key: str, ts: int) -> str:
-    """生成讯飞长语音 API 签名（HMAC-SHA1 + base64）。
+    """生成讯飞长语音 API 签名（MD5 + HMAC-SHA1 + base64）。
 
-    官方算法（lfasr Python demo）：
-        baseString = f"{app_id}{ts}"
-        signa = base64(HMAC-SHA1(secret_key, baseString))
+    官方算法（参考 caitongbo/Speech-to-Text Ifasr_new.py，URL 是 raasr.xfyun.cn/v2/api）：
+        1. md5_hex  = MD5(app_id + ts).hexdigest()           # 32-hex msg
+        2. raw     = HMAC-SHA1(secret_key, md5_hex.bytes)    # 用 MD5 hex 当 msg
+        3. signa   = base64(raw).decode()
 
-    注意：baseString 不带 '&' 分隔符，只是简单的字符串拼接
-    （与实时语音转写 WebSocket 鉴权的 'api_key={key}&timestamp={ts}' 不同）
+    2026-09-27 订正：之前误写成 base64(HMAC-SHA1(secret, f"{app_id}{ts}"))
+    漏了 MD5 一步——讯飞服务端返回 26601 signa verify fail。已按官方 demo 修复。
+
+    注意：baseString 不是 app_id+ts 原串，而是 app_id+ts 先 MD5 一次。
+    与「实时语音转写 WebSocket」的 'api_key={key}&timestamp={ts}' 完全不同。
     """
-    base_string = f"{app_id}{ts}"
-    sig = hmac.new(
-        secret_key.encode("utf-8"),
-        base_string.encode("utf-8"),
-        hashlib.sha1,
-    ).digest()
+    md5 = hashlib.md5()
+    md5.update(f"{app_id}{ts}".encode("utf-8"))
+    md5_hex = md5.hexdigest().encode("utf-8")  # 32-hex msg
+    sig = hmac.new(secret_key.encode("utf-8"), md5_hex, hashlib.sha1).digest()
     return base64.b64encode(sig).decode("utf-8")
 
 

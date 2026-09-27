@@ -26,29 +26,51 @@ sys.path.insert(0, r"src")
 
 
 def test_sign_request():
-    """1. _sign_request 与官方算法一致：base64(HMAC-SHA1(secret_key, f"{app_id}{ts}"))"""
+    """1. _sign_request 与官方 demo 完全一致（caitongbo/Speech-to-Text Ifasr_new.py）：
+
+    讯飞 raasr.xfyun.cn/v2/api 长语音的 signa 算法：
+      md5_hex = MD5(app_id + ts).hexdigest()                    # 32 hex msg
+      raw     = HMAC-SHA1(secret_key, md5_hex.bytes)            # MD5 hex 当 msg
+      signa   = base64(raw).decode()
+
+    2026-09-27 订正：之前 smoke 用错了「期望」算法（base64(HMAC-SHA1(secret, app_id+ts))），
+    那正是当时实现里的 bug。改成「跟官方 demo 独立写一遍」的交叉验证，确保实现真按 demo 写、
+    而非「按 smoke 期望写」。user 真实 API 收到 26601 signa verify fail 即由此 bug 导致。
+    """
     import video_to_article.media.xf_asr as xf
 
     app_id = "5f8b9c0d"
     secret_key = "1234567890abcdef"
     ts = 1700000000
 
-    # 期望值（手动算一遍）：HMAC-SHA1(secret_key, "5f8b9c0d1700000000")
+    # 期望值（官方 demo 独立写一遍，避免「按 smoke 期望写」的循环依赖）
+    md5 = hashlib.md5()
+    md5.update(f"{app_id}{ts}".encode("utf-8"))
+    md5_hex = md5.hexdigest().encode("utf-8")
     expected = base64.b64encode(
+        hmac.new(secret_key.encode("utf-8"), md5_hex, hashlib.sha1).digest()
+    ).decode("utf-8")
+
+    actual = xf._sign_request(app_id, secret_key, ts)
+    print(f"sign = {actual}")
+    assert actual == expected, f"签名与官方 demo 不一致: {actual} != {expected}"
+    # 标准 base64 字符集校验
+    import re
+    assert re.fullmatch(r"[A-Za-z0-9+/=]+", actual), "非标准 base64"
+    print("OK 1: _sign_request 与官方 demo 完全一致\n")
+
+    # 额外：把旧实现（错的）作为反面案例测一次，断言「不应再有旧 signa」，防止再次回归
+    old_buggy = base64.b64encode(
         hmac.new(
             secret_key.encode("utf-8"),
             f"{app_id}{ts}".encode("utf-8"),
             hashlib.sha1,
         ).digest()
     ).decode("utf-8")
-
-    actual = xf._sign_request(app_id, secret_key, ts)
-    print(f"sign = {actual}")
-    assert actual == expected, f"签名不一致: {actual} != {expected}"
-    # 标准 base64 字符集校验
-    import re
-    assert re.fullmatch(r"[A-Za-z0-9+/=]+", actual), "非标准 base64"
-    print("OK 1: _sign_request 与官方算法一致\n")
+    assert actual != old_buggy, (
+        "回归警告：signa 又算成了旧错算法（漏了 MD5 一步）"
+    )
+    print("OK 1b: 实现未退回旧 bug 算法（已含 MD5 步骤）\n")
 
 
 def test_mock_mode_no_credentials():

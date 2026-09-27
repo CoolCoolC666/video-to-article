@@ -115,6 +115,12 @@ def build_blog_prompt_input(
     else:
         lines.append(f"来源链接：{source}")
 
+    # 2026-09-14: 输出发布日期（processor.py 已计算：upload_date 优先，缺失时 fallback 到 audio mtime）
+    # 防止 LLM 凭训练数据先验分布捏造日期（曾出现 2024-10-12 幻觉）
+    publish_date = (youtube_metadata or {}).get("publish_date")
+    if publish_date:
+        lines.append(f"发布日期（必填到 front-matter.date）：{publish_date}")
+
     lines.extend(
         [
             "",

@@ -11,6 +11,7 @@ from .blog import (
     make_article_markdown_filename,
     replace_frontmatter_field,
     split_frontmatter,
+    strip_markdown_code_fence,
     validate_snack_recipe_article,
 )
 from .config import load_config
@@ -556,6 +557,26 @@ def process_video(
                 logger.warning(f"跳过无效的提示词: {prompt_name}")
                 continue
 
+            # 2026-09-14: 计算发布日期（防止 LLM 凭训练数据先验分布捏造日期，曾出现 2024-10-12 幻觉）
+            # 优先级：metadata.upload_date > audio_path mtime（2B fallback）> skip
+            # 显式区别于"option 1"——这里只注入 context，不覆盖 LLM 生成的 front-matter.date。
+            if youtube_metadata is None:
+                youtube_metadata = {}
+            _publish_date = None
+            _raw = youtube_metadata.get("upload_date", "")
+            if _raw and len(_raw) == 8 and _raw.isdigit():
+                _publish_date = f"{_raw[:4]}-{_raw[4:6]}-{_raw[6:8]} 20:00:00"
+            if not _publish_date and audio_path:
+                try:
+                    from datetime import datetime as _dt
+                    import os as _os
+                    _mtime = _os.path.getmtime(audio_path)
+                    _publish_date = _dt.fromtimestamp(_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                except OSError:
+                    pass
+            if _publish_date:
+                youtube_metadata["publish_date"] = _publish_date
+
             # 2026-09-07 增强：所有 prompts 都注入元数据（标题/UP/BV/平台），
             # 避免 LLM 不识别游戏导致跑题（如崩铁错猜成 LOL）。
             prompt_input = build_blog_prompt_input(
@@ -570,6 +591,10 @@ def process_video(
 
             optimized_text = optimize_text_with_llm(prompt_input, config, prompt_name)
             if optimized_text:
+                # 2026-09-14: 通用剥首尾 ```markdown / ```md 围栏（snack 路径在 format_snack_recipe_article 内部自带，重复调用无副作用）
+                # 修复点：general_article / limbus_company 等其他 prompt 落盘的 .md 文件首行带 ```markdown 围栏，导致
+                # Hexo / AnZhiYu 解析 frontmatter 失败（认为 frontmatter 不在文件首 1 行）。
+                optimized_text = strip_markdown_code_fence(optimized_text)
                 if prompt_name == "snack_recipe":
                     optimized_text = format_snack_recipe_article(
                         optimized_text,

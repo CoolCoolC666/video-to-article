@@ -154,6 +154,10 @@ class SettingsDialog(QDialog):
         self.tr_engine.addItem("funasr", "funasr")
         self.tr_engine.addItem("whisper", "whisper")
         self.tr_engine.addItem("qwen_asr", "qwen_asr")
+        # 2026-09-27 新增：讯飞听见云端识别（xf_asr 引擎）
+        self.tr_engine.addItem("xf_asr（讯飞听见）", "xf_asr")
+        # 2026-09-27 防呆：切到 xf_asr 且凭证齐全时自动取消 Mock（避免"填了凭证但忘了取消勾选"陷阱）
+        self.tr_engine.currentIndexChanged.connect(self._on_tr_engine_changed)
         self.tr_funasr = QLineEdit()
         self.tr_funasr.setToolTip(
             "仅在 ASR 引擎 = funasr 时生效。\n"
@@ -251,6 +255,63 @@ class SettingsDialog(QDialog):
         qform.addRow("Device（GPU / CPU fallback）", self.qwen_device)
         outer.addWidget(qwen_box)
 
+        # 2026-09-27 新增：讯飞听见（xf_asr 引擎专用）
+        # 2026-09-27 订正：长语音鉴权只用 APPID + SecretKey 两件，删 API Key 字段 → 5 字段
+        xf_box = QGroupBox("讯飞听见 高级（xf_asr 引擎专用）")
+        xform = QFormLayout(xf_box)
+
+        self.xf_app_id = QLineEdit()
+        self.xf_app_id.setPlaceholderText("讯飞控制台 → 我的应用 → APPID")
+        self.xf_secret_key = QLineEdit()
+        self.xf_secret_key.setEchoMode(QLineEdit.Password)
+        self.xf_secret_key.setPlaceholderText(
+            "SecretKey（Password 模式）—— 长语音鉴权只这一件"
+        )
+
+        self.xf_language = QComboBox()
+        # 讯飞长语音转写支持 cn/en/ja 等；与 qwen_asr 不同，没有强制单语种限制
+        self.xf_language.addItem("中文（cn）", "cn")
+        self.xf_language.addItem("英文（en）", "en")
+        self.xf_language.addItem("日语（ja）", "ja")
+        self.xf_language.addItem("粤语（cn-cantonese）", "cn-cantonese")
+        self.xf_language.setToolTip(
+            "讯飞长语音 API 支持 cn/en/ja 等多语种。"
+            "讯飞也支持自动检测，但显式指定能减少识别误差。"
+        )
+
+        self.xf_mock = QCheckBox("Mock 模式（不调网络，返回 fake 文本，便于本地调试）")
+        self.xf_mock.setChecked(True)  # 默认开：用户没填凭证时不会真的调 API
+
+        self.xf_max_wait = QSpinBox()
+        self.xf_max_wait.setRange(30, 7200)
+        self.xf_max_wait.setValue(600)
+        self.xf_max_wait.setToolTip(
+            "任务轮询超时（秒）。讯飞长音频通常 1-2 分钟出结果，"
+            "1 小时以上视频建议 1800+ 秒。"
+        )
+
+        xform.addRow("APP ID", self.xf_app_id)
+        xform.addRow("Secret Key", self.xf_secret_key)
+        xform.addRow("语言", self.xf_language)
+        xform.addRow(self.xf_mock)
+        xform.addRow("轮询超时（秒）", self.xf_max_wait)
+        outer.addWidget(xf_box)
+
+        # 讯飞听见说明（mock 与隐私）
+        xf_tip = QLabel(
+            "💡 讯飞听见云端识别（xf_asr 引擎专用）：\n"
+            "  · 默认 Mock 模式：勾选时不调网络、不需要凭证，返回 fake 中文文本\n"
+            "  · 关闭 Mock + 填全 APPID + SecretKey → 调真实 API（数据传到讯飞云端，注意隐私）\n"
+            "  · 长语音鉴权只需 APPID + SecretKey 两件套（APIKey 是短音频 ifasr 字段，长语音不用）\n"
+            "  · 凭证缺失时会自动降级 Mock + WARNING（不报错）\n"
+            "  · 长音频（> 7.5 分钟）自动切 5 分钟一段，逐段上传 + 拼接\n"
+            "  · 注册地址：https://www.xfyun.cn/ → 控制台 → 语音转写（长语音）→ 创建应用\n"
+            "  · 免费 5 小时试用包，足够跑通流程；超出按讯飞官方价目计费"
+        )
+        xf_tip.setWordWrap(True)
+        xf_tip.setStyleSheet("color: #666; font-size: 11px;")
+        outer.addWidget(xf_tip)
+
         # 2026-09-09: 中英混合等组合语言值的 API 限制说明（不暴露误导项）
         # qwen_asr 0.0.6 validate_language 只接受 30 种单语种；Chinese 跑混合足够
         mix_tip = QLabel(
@@ -292,6 +353,32 @@ class SettingsDialog(QDialog):
 
         outer.addStretch(1)
         self.tabs.addTab(_scroll_page(page), "转写")
+
+    def _on_tr_engine_changed(self, _index: int) -> None:
+        """2026-09-27 防呆：切到 xf_asr 引擎时自动同步 Mock 状态。
+
+        触发场景：
+        - 用户在「默认 ASR 引擎」下拉切到 xf_asr
+        - 若 APPID + SecretKey 都填了 + Mock 仍勾选 → 自动取消 Mock
+          （因为凭证齐全还勾 mock = 实际走 mock 浪费 API 调用）
+        - 若凭证缺失 → 保持 Mock 勾选（避免启动时悄悄调 API 失败）
+        - 切回其他引擎（funasr/whisper/qwen_asr）→ 不动 xf_asr GroupBox
+          （用户可能只是临时切走，回头还要切回来用）
+        """
+        engine = self.tr_engine.currentData()
+        if engine != "xf_asr":
+            return
+        has_creds = bool(
+            self.xf_app_id.text().strip() and self.xf_secret_key.text().strip()
+        )
+        if has_creds and self.xf_mock.isChecked():
+            self.xf_mock.setChecked(False)
+            QMessageBox.information(
+                self,
+                "讯飞听见 已自动取消 Mock",
+                "检测到 xf_asr 引擎 + 凭证齐全，自动取消 Mock 模式（避免误调 mock）。\n"
+                "如确实要本地调试，可重新勾选。",
+            )
 
     def _pick_qwen_context(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -530,6 +617,20 @@ class SettingsDialog(QDialog):
         didx = self.qwen_device.findData(dev)
         self.qwen_device.setCurrentIndex(didx if didx >= 0 else 0)
 
+        # 讯飞听见（xf_asr 引擎专用，2026-09-27 新增；2026-09-27 订正：删 api_key 字段）
+        xa = (tr.get("xf_asr") or {})
+        self.xf_app_id.setText(str(xa.get("app_id") or ""))
+        self.xf_secret_key.setText(str(xa.get("secret_key") or ""))
+        xlang = str(xa.get("language") or "cn")
+        xidx = self.xf_language.findData(xlang)
+        self.xf_language.setCurrentIndex(xidx if xidx >= 0 else 0)
+        # 缺凭证时默认 mock=true（避免启动时悄悄调 API 失败）
+        self.xf_mock.setChecked(bool(xa.get("mock", True)))
+        try:
+            self.xf_max_wait.setValue(int(xa.get("max_wait_seconds") or 600))
+        except (TypeError, ValueError):
+            self.xf_max_wait.setValue(600)
+
         yt = self._config.get("youtube") or {}
         browser = str(yt.get("cookies_from_browser") or "")
         idx = self.yt_browser.findData(browser)
@@ -624,6 +725,13 @@ class SettingsDialog(QDialog):
                     "language": self.qwen_language.currentData() or "Chinese",
                     "device": self.qwen_device.currentData() or "auto",
                 },
+                "xf_asr": {
+                    "app_id": self.xf_app_id.text().strip(),
+                    "secret_key": self.xf_secret_key.text().strip(),
+                    "language": self.xf_language.currentData() or "cn",
+                    "mock": self.xf_mock.isChecked(),
+                    "max_wait_seconds": self.xf_max_wait.value(),
+                },
             },
             "youtube": {
                 "cookies_from_browser": self.yt_browser.currentData() or "",
@@ -680,6 +788,12 @@ class SettingsDialog(QDialog):
     def _save(self) -> None:
         try:
             current = load_config() or {}
+            # 2026-09-27 订正：清理 xf_asr 残留冗余字段
+            # APIKey 是短音频 ifasr 实时接口的字段，长语音 lfasr / ifasr_new 不参与签名
+            # 此前 6 字段版遗留的 api_key 在新代码里既不读也不写，但磁盘上还残留看着碍眼
+            xa_existing = current.get("transcribe", {}).get("xf_asr")
+            if isinstance(xa_existing, dict):
+                xa_existing.pop("api_key", None)
             deep_update(current, self._collect_updates())
             save_config(current)
             self._config = current

@@ -23,6 +23,7 @@ __all__ = [
     "transcribe_audio_with_whisper",
     "transcribe_audio_with_funasr",
     "transcribe_audio_with_qwen_asr",
+    "transcribe_audio_with_xf_asr",
     "extract_funasr_text",
     "resolve_funasr_model_name",
     "resolve_funasr_vad_model_name",
@@ -429,6 +430,12 @@ def transcribe_audio(
         # 延迟 import：避免未装 qwen_asr 时启动报错
         from .qwen_asr import transcribe_audio_with_qwen_asr
         return transcribe_audio_with_qwen_asr(audio_path, qwen_asr_config or {})
+    if asr_engine == "xf_asr":
+        # 2026-09-27 新增：讯飞听见云端识别 backend
+        # 凭证缺失自动降级 mock（与 qwen_asr 保持一致的容错策略）
+        # 延迟 import：避免未装 requests 时启动报错（pyproject 已固定 requests>=2.31）
+        from .xf_asr import transcribe_audio_with_xf_asr
+        return transcribe_audio_with_xf_asr(audio_path, qwen_asr_config or {})
     raise ValueError(f"不支持的 ASR 引擎: {asr_engine}")
 
 

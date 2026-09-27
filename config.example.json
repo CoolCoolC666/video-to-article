@@ -15,7 +15,14 @@
     "asr_engine": "funasr",
     "funasr_model": "sensevoice",
     "auto_optimize": true,
-    "funasr_cache_dir": ""
+    "funasr_cache_dir": "",
+    "xf_asr": {
+      "app_id": "your-xfyun-app-id",
+      "secret_key": "your-xfyun-secret-key",
+      "language": "cn",
+      "mock": true,
+      "max_wait_seconds": 600
+    }
   },
   "youtube": {
     "cookies_from_browser": "firefox",

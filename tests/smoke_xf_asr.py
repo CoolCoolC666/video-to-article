@@ -250,6 +250,109 @@ def test_settings_dialog_xf_asr_roundtrip():
     print("OK 7c: 未破坏既有 qwen_asr 块\n")
 
 
+def test_upload_url_format():
+    """8. _upload_audio 必须用 URL query string + raw body（不 multipart！）
+
+    这是和官方 demo（caitongbo/Speech-to-Text Ifasr_new.py 等）一致的契约。
+    之前用 requests.post(files={"data": ...}) 的 multipart 格式被讯飞拒——
+    返回 code=26600「音频使用表单方式上传」（即「不要走 multipart」）。
+
+    验证清单：
+      ✅ URL 是 /v2/api/upload?...query string... 形式
+      ✅ 鉴权参数 (appId/signa/ts/fileSize/fileName/language) 全在 query
+      ✅ Content-Type header = application/json（不 multipart）
+      ✅ data 参数是 raw bytes（不包含 multipart boundary / Content-Disposition）
+    """
+    import video_to_article.media.xf_asr as xf
+    from urllib.parse import urlparse, parse_qs
+
+    audio = _make_test_audio(seconds=1)
+    captured: dict = {}
+
+    class FakeResp:
+        status_code = 200
+        text = (
+            '{"code":"000000","descInfo":"success",'
+            '"content":{"taskId":"fake-task-id-abc123"}}'
+        )
+
+        def json(self):
+            import json as _json
+            return _json.loads(self.text)
+
+    class FakeSession:
+        def post(self, url, headers=None, data=None, timeout=None):
+            captured["url"] = url
+            captured["headers"] = headers or {}
+            captured["data"] = data
+            captured["timeout"] = timeout
+            return FakeResp()
+
+    xf._cached_session = FakeSession()
+    try:
+        task_id = xf._upload_audio(
+            audio,
+            app_id="test_app_id_xyz",
+            secret_key="test_secret_key_abc",
+            language="cn",
+        )
+
+        # === 1. URL 必须是 query string 风格 ===
+        parsed = urlparse(captured["url"])
+        assert parsed.path == "/v2/api/upload", (
+            f"upload URL path 错: {parsed.path}（期望 /v2/api/upload）"
+        )
+        qs = parse_qs(parsed.query)
+        required_qs = ["appId", "signa", "ts", "fileSize", "fileName", "language"]
+        for key in required_qs:
+            assert key in qs, (
+                f"关键参数 {key!r} 没出现在 query string 里：\nURL={captured['url']!r}"
+            )
+        assert qs["appId"] == ["test_app_id_xyz"], f"appId 错: {qs['appId']}"
+        assert qs["fileName"] == [os.path.basename(audio)], f"fileName 错"
+        assert qs["language"] == ["cn"], f"language 错"
+        print(f"upload URL = {captured['url']}")
+        print(f"query keys = {sorted(qs.keys())}")
+
+        # === 2. Content-Type header 必须是 application/json ===
+        ct = captured["headers"].get("Content-Type", "")
+        assert ct == "application/json", (
+            f"Content-Type 应是 application/json，实得 {ct!r}——"
+            f"走 multipart 会带 boundary=xxx，错误码 26600 即由此触发"
+        )
+
+        # === 3. data 必须是 raw bytes（不是 multipart 编码） ===
+        raw = captured["data"]
+        assert isinstance(raw, (bytes, bytearray)), (
+            f"data 应是 raw bytes，实得 {type(raw).__name__}"
+        )
+        # 关键反断言：multipart body 必有这些特征，全都不能出现
+        assert b"--" not in raw[:60], (
+            "data 出现 '--...'——是 multipart 的 boundary！仍走 files= 路径"
+        )
+        assert b"Content-Disposition" not in raw, (
+            "data 包含 'Content-Disposition'——仍是 multipart files 字段！"
+        )
+        assert b"name=" not in raw[:100], (
+            "data 包含 'name='（multipart 表单字段标识）——仍是 files= 路径"
+        )
+        # raw data 应等于文件实际字节（不是字典化、空、被截断）
+        with open(audio, "rb") as f:
+            expected = f.read()
+        assert raw == expected, (
+            f"data 字节不匹配文件实际内容（multipart/截断嫌疑）"
+        )
+
+        assert task_id == "fake-task-id-abc123", f"task_id 错: {task_id}"
+        print(
+            "OK 8: _upload_audio 用 URL query string + raw bytes（不 multipart files）\n"
+        )
+    finally:
+        xf._release_cached_session()
+        if os.path.exists(audio):
+            os.unlink(audio)
+
+
 def _make_test_audio(seconds: int = 3) -> str:
     """生成一个测试用 wav（用 ffmpeg 合成静音）。失败时返回任意 wav。"""
     import subprocess
@@ -291,6 +394,7 @@ if __name__ == "__main__":
     test_split_threshold_logic()
     test_atexit_registered()
     test_settings_dialog_xf_asr_roundtrip()
+    test_upload_url_format()
     print("=" * 50)
     print("ALL xf_asr smoke tests passed ✓")
     print("=" * 50)

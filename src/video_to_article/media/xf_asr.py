@@ -37,6 +37,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 from typing import List, Optional
 
@@ -264,6 +265,27 @@ def _upload_audio(
 ) -> str:
     """上传音频到讯飞 API，返回 task_id。
 
+    讯飞 raasr.xfyun.cn/v2/api/upload 的真实协议 —— 与 caitongbo/Speech-to-Text
+    Ifasr_new.py 等官方/民间 Python demo 一致：
+
+      1. 所有鉴权/元参数 (appId / signa / ts / fileSize / fileName /
+         duration / language / sliceSize / ...) 走 URL **query string**，
+         拼成 `…/upload?appId=xxx&signa=yyy&ts=zzz&...`
+      2. 音频二进制 bytes 直接走 HTTP body（`requests.post(data=...)`）
+      3. Content-Type header = `application/json`
+
+    **不要**用 `requests.post(files={"data": ...})`！requests 会自动生成
+    `multipart/form-data; boundary=xxx` 格式，与讯飞期望的「query string +
+    raw body」完全不一致 → 服务端返回 code=26600
+    「转写业务通用错误 | 音频需上传二进制音频流数据 | 音频使用表单方式上传」。
+
+    与实时语音识别（WebSocket）鉴权不同，HTTP 长语音 REST API 走 query string。
+
+    历史：2026-09-30 修正。之前用 multipart files，被 26600 挡住。
+    参照多 demo（caitongbo/Speech-to-Text Ifasr_new.py / richice/-/xf_lfasr.py /
+    JianyaoChen/video-carrier/xf_lfasr.py / lanbinleo/bili2text/xunfei.py）
+    一致方案。
+
     Raises:
         RuntimeError: 上传失败（凭证错 / 文件过大 / 网络问题）
     """
@@ -278,27 +300,32 @@ def _upload_audio(
             f"讯飞长语音 API 单文件上限 500MB（应自动切段却失败？检查 ffmpeg）"
         )
 
-    # 官方 SDK 用 multipart/form-data（files 参数），不要用 data=
-    # （data= 走 application/x-www-form-urlencoded，文件会被当字符串截断）
+    # === 关键：所有鉴权/元参数走 URL query string，不要放 body ===
+    form_data = {
+        "appId": app_id,
+        "signa": signa,
+        "ts": str(ts),
+        "fileSize": str(audio_size),
+        "fileName": Path(audio_path).name,
+        "sliceSize": str(audio_size),
+        "language": language,
+    }
+    upload_url_with_query = f"{_UPLOAD_URL}?{urllib.parse.urlencode(form_data)}"
+
+    logger.info(
+        f"上传音频到讯飞: {audio_path} "
+        f"({audio_size / 1024 / 1024:.2f}MB, language={language})"
+    )
+
+    # === 音频二进制走 raw body（不是 multipart files）===
     with open(audio_path, "rb") as f:
-        files = {"data": (Path(audio_path).name, f, "audio/wav")}
-        form_data = {
-            "appId": app_id,
-            "signa": signa,
-            "ts": str(ts),
-            "sliceSize": str(audio_size),
-            "language": language,
-        }
-        logger.info(
-            f"上传音频到讯飞: {audio_path} "
-            f"({audio_size / 1024 / 1024:.2f}MB, language={language})"
-        )
-        resp = session.post(
-            _UPLOAD_URL,
-            data=form_data,
-            files=files,
-            timeout=180,
-        )
+        audio_bytes = f.read()
+    resp = session.post(
+        upload_url_with_query,
+        headers={"Content-Type": "application/json"},
+        data=audio_bytes,
+        timeout=180,
+    )
     if resp.status_code != 200:
         raise RuntimeError(
             f"讯飞 upload HTTP {resp.status_code}: {resp.text[:300]}"

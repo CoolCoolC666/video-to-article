@@ -132,7 +132,11 @@ def test_validate_credentials_missing():
 
 
 def test_split_threshold_logic():
-    """5. 长音频切段阈值：> 7.5 分钟必切，< 不切"""
+    """5. 长音频处理：2026-09-30 改为「客户端不切段，server 自己处理长音频」
+
+    之前的版本：>7.5 分钟切 5 分钟一段
+    现在的版本：永远不切段（讯飞 raasr v2 server 端自动处理长音频）
+    """
     import video_to_article.media.xf_asr as xf
 
     # 短音频 → 不切段
@@ -145,25 +149,23 @@ def test_split_threshold_logic():
     finally:
         os.unlink(short_audio)
 
-    # 长音频（无法实测 7.5 分钟音频文件，patch _probe_audio_duration 模拟）
+    # 长音频（patch _probe_audio_duration 模拟 600s）：现在也不切段
     import unittest.mock
     long_audio = _make_test_audio(seconds=10)
     try:
         with unittest.mock.patch.object(
             xf, "_probe_audio_duration", return_value=600.0
         ):
-            # 强制 mock 切段（避免真切 600s 的长音频）
-            with unittest.mock.patch.object(
-                xf, "_do_split", wraps=xf._do_split
-            ) as mock_split:
-                # _do_split 需要 ffmpeg；用 mock 拦截
-                mock_split.return_value = [
-                    Path(tempfile.mkdtemp(prefix="xf_asr_chunks_")) / "chunk_000000.wav",
-                    Path(tempfile.mkdtemp(prefix="xf_asr_chunks_")) / "chunk_300000.wav",
-                ]
-                chunks = xf._split_audio_for_long(long_audio)
-                assert len(chunks) == 2, f"长音频应切 2 段，实际 {len(chunks)} 段"
-                print(f"OK 5b: 长音频 600s 自动切 2 段\n")
+            chunks = xf._split_audio_for_long(long_audio)
+            assert len(chunks) == 1, (
+                f"长音频现在不切段（讯飞 server 自动处理），实际 {len(chunks)} 段"
+            )
+            assert chunks[0].name == os.path.basename(long_audio), (
+                "长音频应原样返回（不切段）"
+            )
+            # 反向断言：_do_split 不应被调用
+            # （因为 _split_audio_for_long 已经不切段了）
+            print(f"OK 5b: 长音频 600s 不切段（server 端自动处理）\n")
     finally:
         os.unlink(long_audio)
 
@@ -303,7 +305,7 @@ def test_upload_url_format():
             f"upload URL path 错: {parsed.path}（期望 /v2/api/upload）"
         )
         qs = parse_qs(parsed.query)
-        required_qs = ["appId", "signa", "ts", "fileSize", "fileName", "language"]
+        required_qs = ["appId", "signa", "ts", "fileSize", "fileName", "language", "duration"]
         for key in required_qs:
             assert key in qs, (
                 f"关键参数 {key!r} 没出现在 query string 里：\nURL={captured['url']!r}"
@@ -311,6 +313,9 @@ def test_upload_url_format():
         assert qs["appId"] == ["test_app_id_xyz"], f"appId 错: {qs['appId']}"
         assert qs["fileName"] == [os.path.basename(audio)], f"fileName 错"
         assert qs["language"] == ["cn"], f"language 错"
+        # duration 必须是正整数秒数（demo 一致必传）
+        dur_val = int(qs["duration"][0])
+        assert dur_val >= 1, f"duration 必须 >= 1 秒，实得 {dur_val}"
         print(f"upload URL = {captured['url']}")
         print(f"query keys = {sorted(qs.keys())}")
 

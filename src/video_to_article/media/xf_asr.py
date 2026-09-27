@@ -162,24 +162,28 @@ def _split_audio_for_long(
     audio_path: str,
     segment_sec: int = CHUNK_SEGMENT_SEC,
 ) -> List[Path]:
-    """长音频自动切段（ffmpeg）。
+    """长音频处理策略。
 
-    - 时长 <= 7.5 分钟 → 不切段，返回 [audio_path]
-    - 时长 > 7.5 分钟 → 切到 temp 目录，每段 5 分钟
-    - 输出 wav 16kHz 单声道（讯飞推荐格式）
+    2026-09-30 简化：客户端不再切段。
+    讯飞 raasr.xfyun.cn/v2/api 服务端自己会处理长音频（官方文档明示 ≤500MB
+    单文件直传即可），客户端切段反而引入风险——任何一段失败都整体失败，
+    切段边界可能引入静音或 wav 头丢失，且增加 HTTP 请求次数。
+
+    保留函数签名 + threshold 常量以便未来重新启用（如果 server 端改了限制）。
+
+    Returns:
+        永远 [Path(audio_path)]——不切段
     """
-    duration = _probe_audio_duration(audio_path)
-    if duration <= 0:
-        # 探测失败：保险起见**仍切**（防 >500MB 单文件超限）
-        logger.warning(f"无法探测时长，强制按 {segment_sec}s 切段（防超限）")
-        return _do_split(audio_path, segment_sec, 99999)
-    if duration <= CHUNK_THRESHOLD_SEC:
-        logger.info(f"音频时长 {duration:.1f}s <= {CHUNK_THRESHOLD_SEC}s，不切段")
-        return [Path(audio_path)]
-    logger.info(
-        f"音频时长 {duration:.1f}s > {CHUNK_THRESHOLD_SEC}s，自动切段（每段 {segment_sec}s）"
-    )
-    return _do_split(audio_path, segment_sec, duration)
+    audio_path_obj = Path(audio_path)
+    duration = _probe_audio_duration(audio_path_obj)
+    if duration > 0:
+        logger.info(
+            f"音频时长 {duration:.1f}s——讯飞 raasr v2 API 服务端自动处理长音频，"
+            f"客户端不再切段（{audio_path_obj.name}）"
+        )
+    else:
+        logger.info(f"讯飞 raasr v2 API 直接上传：{audio_path_obj.name}")
+    return [audio_path_obj]
 
 
 def _cleanup_chunks(chunk_paths: List[Path]) -> None:
@@ -300,6 +304,11 @@ def _upload_audio(
             f"讯飞长语音 API 单文件上限 500MB（应自动切段却失败？检查 ffmpeg）"
         )
 
+    # === 探测时长（用于 form_data 的 duration 字段）===
+    # demo 一致必传 duration 参数（单位秒，估算转写耗时用）
+    # ⚠️ duration 不准可能让 server 误判超时
+    audio_duration = _probe_audio_duration(Path(audio_path))
+
     # === 关键：所有鉴权/元参数走 URL query string，不要放 body ===
     form_data = {
         "appId": app_id,
@@ -309,6 +318,7 @@ def _upload_audio(
         "fileName": Path(audio_path).name,
         "sliceSize": str(audio_size),
         "language": language,
+        "duration": str(int(audio_duration)) if audio_duration > 0 else "60",
     }
     upload_url_with_query = f"{_UPLOAD_URL}?{urllib.parse.urlencode(form_data)}"
 

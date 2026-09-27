@@ -88,3 +88,7 @@ switch_*.py
 strip_*.py
 run_qwen_asr.py
 transcribe.py
+# 一次性调试脚本（个人用，不入公共 fork）
+test_publish_date.py
+test_wol_state.py
+test_wol_state.ps1

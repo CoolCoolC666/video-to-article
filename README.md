@@ -208,6 +208,39 @@ python packaging/make_models_funasr_zip.py
 
 上游 `src/video_to_article/media/` 目录只有 `__init__.py` / `audio.py` / `download.py` / `ffmpeg_tools.py` / `thumbnails.py`，**没有**任何 Qwen3-ASR 相关代码。fork **新增** `src/video_to_article/media/qwen_asr.py`（~520 行），提供 `transcribe_audio_with_qwen_asr()` 接口，与现有 `funasr` 引擎并列。
 
+### 新增：讯飞听见云端识别（xf_asr）
+
+fork **新增** `src/video_to_article/media/xf_asr.py`（~330 行），提供 `transcribe_audio_with_xf_asr()` 接口：
+
+| 改动 | 内容 | 为什么改 |
+|------|------|----------|
+| **长语音转写 REST API** | 调 `https://raasr.xfyun.cn/v2/api/upload` + `getResult` 两步，HMAC-SHA1 签名 | 上游没有云端 ASR backend，本地 FunASR/Qwen3-ASR 在噪声大 / 方言 / 多人对话场景识别率不够 |
+| **鉴权只用 APPID + SecretKey 两件套** | 长语音 lfasr / ifasr_new 签名算法 `signa = base64(HMAC-SHA1(secret_key, f"{app_id}{ts}"))`，**不**需要 APIKey | APIKey 是短音频 ifasr 实时接口的字段，长语音 lfasr 控制台只下发 APPID + SecretKey |
+| **Mock 模式（默认开启）** | 凭证缺失或显式 `mock=true` 时返回 fake 中文文本，不调网络 | 无凭证也能跑通流程 + GUI 验证，避免启动时悄悄调 API 失败 |
+| **长音频自动切段** | > 7.5 分钟切 5 分钟一段，逐段 upload + poll，最后拼接 | 讯飞单文件 ≤500MB / 5h；长视频超限必切 |
+| **atexit 兜底清理** | 进程退出清残留 `xf_asr_chunks_*` tempdir | GUI 强杀 / 进程崩溃场景 |
+| **requests.Session cache** | 模块级 session 复用连接池 | 多段上传不每次重连 |
+
+**配置位置**：「设置 → 转写 → 讯飞听见 高级」GroupBox。CLI 用 `--asr-engine xf_asr`。
+
+**凭证获取**：https://www.xfyun.cn/ 注册 → 控制台 → 「语音转写（长语音）」→ 创建应用 → **APPID + SecretKey**（**只这两项**，不需要 APIKey）。新注册免费 5 小时试用包。
+
+#### 凭证齐全但还是走 Mock 的排查
+
+`transcribe_audio_with_xf_asr()` 入口按三种情况打不同日志，让用户一眼看出走哪条分支：
+
+| 情况 | 日志级别 | 含义 |
+|------|----------|------|
+| 凭证齐全 + Mock 勾上 | **WARNING** | 你填了凭证但忘了取消 Mock 勾选——**将走 Mock 不调真实 API** |
+| Mock 显式勾上（无论凭证） | INFO | 本地调试模式 |
+| Mock 未勾 + 凭证缺失 | **WARNING** | 自动降级 Mock，需补 APPID + SecretKey |
+
+另外 GUI 在「默认 ASR 引擎」下拉切到 `xf_asr（讯飞听见）` 时会**自动取消 Mock 勾选**（前提是凭证齐全），并弹窗提醒，避免「填了凭证但忘了取消勾选」的陷阱。
+
+#### 残留冗余字段自动清理
+
+旧版本（6 字段）遗留的 `xf_asr.api_key` 字段在 2026-09-27 重构后**不再读取也不再写出**，但磁盘 config.json 可能还残留。下次点 GUI 「保存设置」时 `_save()` 会自动 `xf_asr.pop("api_key", None)` 清理冗余字段。
+
 ### Qwen3-ASR 引擎的健壮性增强
 
 | 改动 | 内容 | 为什么改 |

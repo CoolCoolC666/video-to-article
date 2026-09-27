@@ -8,12 +8,14 @@
 
 ```powershell
 cd E:\000~\YilanChengWen-src
-python tests\smoke_settings.py
-python tests\smoke_fallback.py
-python tests\smoke_language.py
-python tests\smoke_jp_kr.py
-python tests\smoke_release.py
-python tests\smoke_cleanup.py
+.venv\Scripts\python.exe tests\smoke_settings.py
+.venv\Scripts\python.exe tests\smoke_fallback.py
+.venv\Scripts\python.exe tests\smoke_language.py
+.venv\Scripts\python.exe tests\smoke_jp_kr.py
+.venv\Scripts\python.exe tests\smoke_release.py
+.venv\Scripts\python.exe tests\smoke_cleanup.py
+.venv\Scripts\python.exe tests\smoke_thinking.py
+.venv\Scripts\python.exe tests\smoke_xf_asr.py
 ```
 
 脚本内用 `sys.path.insert(0, r"src")` 把 `src/` 加到模块路径，所以 cwd 必须是仓库根。
@@ -34,3 +36,6 @@ python tests\smoke_cleanup.py
 | `smoke_jp_kr.py` | Japanese/Korean 路径能走通（不实际转写，只验配置）|
 | `smoke_release.py` | 释放 ASR 模型按钮 + 状态刷新 |
 | `smoke_cleanup.py` | 临时缓存清理（%TEMP%\qwen_asr_chunks_*）|
+| `smoke_thinking.py` | `_strip_thinking_block()` 剥离 Qwen3 / DeepSeek 思考块 |
+| `smoke_xf_asr.py` | 讯飞听见云端识别（2026-09-27 新增，2026-09-27 订正字段）：HMAC-SHA1 签名算法、Mock 三种情况日志区分、长音频切段阈值、atexit 清理、SettingsDialog **5 字段读写**（删 api_key）+ 防呆不破坏 qwen_asr 块 |
+| `smoke_xf_e2e.py` | xf_asr 端到端 dispatch（音频 → transcribe_audio → xf_asr 主入口）+ `__all__` re-export 校验 |

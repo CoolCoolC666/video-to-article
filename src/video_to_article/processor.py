@@ -132,6 +132,28 @@ def load_batch_report_completions(video_urls: List[str], batch_root: Optional[st
     return completions
 
 
+def _resolve_engine_config(config: dict | None, asr_engine: str) -> dict | None:
+    """按 asr_engine 装对应引擎的配置块。
+
+    2026-09-27 修：原本只装 transcribe.qwen_asr 块传给 audio.py，给 xf_asr 引擎也传 qwen_asr 配置
+    → 凭证缺失误降 mock（xf_asr 看到 qwen_asr 配置里没有 app_id）。
+    现在按 asr_engine 装对应块：
+      - qwen_asr → transcribe.qwen_asr 块
+      - xf_asr   → transcribe.xf_asr 块
+      - 其它     → None（whisper / funasr 无需引擎专属配置）
+
+    返回 None 时由 audio.py 走引擎内置默认值。
+    """
+    if not config:
+        return None
+    tr = config.get("transcribe", {}) or {}
+    if asr_engine == "qwen_asr":
+        return tr.get("qwen_asr", {})
+    if asr_engine == "xf_asr":
+        return tr.get("xf_asr", {})
+    return None
+
+
 def process_video(
     video_url: str,
     model_size: str = "tiny",
@@ -509,6 +531,8 @@ def process_video(
             print(f"   ASR 引擎: FunASR ({funasr_model})")
         elif asr_engine == "qwen_asr":
             print(f"   ASR 引擎: Qwen3-ASR (来自 qwen_asr 包)")
+        elif asr_engine == "xf_asr":
+            print("   ASR 引擎: 讯飞听见 (xf_asr，云端 API)")
         else:
             print(f"   ASR 引擎: Whisper ({model_size})")
         try:
@@ -518,9 +542,11 @@ def process_video(
                 cpu_threads,
                 asr_engine,
                 funasr_model,
-                # 2026-09-07 修复：把 transcribe.qwen_asr 整块配置传给 audio.py，
+                # 2026-09-07：把 transcribe.qwen_asr 整块配置传给 audio.py；
                 # 否则 qwen_asr.py 用默认 model_id=0.6B 而不是 config 里的 1.7B。
-                qwen_asr_config=(config.get("transcribe", {}) or {}).get("qwen_asr", {}) if config else None,
+                # 2026-09-27：扩到按 asr_engine 装对应块 — 给 xf_asr 装 transcribe.xf_asr，
+                # 不再误把 qwen_asr 配置当 xf_asr 配置传 → 凭证不缺，不会误走 mock。
+                engine_config=_resolve_engine_config(config, asr_engine),
             )
         except Exception as e:
             logger.error(f"转写失败: {e}")

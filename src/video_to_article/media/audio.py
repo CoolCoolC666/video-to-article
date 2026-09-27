@@ -414,9 +414,15 @@ def transcribe_audio(
     cpu_threads: int = 4,
     asr_engine: str = "funasr",
     funasr_model: str = "sensevoice",
-    qwen_asr_config: dict = None,
+    engine_config: dict = None,
 ) -> str:
-    """Transcribe audio with the selected ASR engine."""
+    """Transcribe audio with the selected ASR engine.
+
+    engine_config 是「当前引擎专属」的配置块：
+    - qwen_asr → config.transcribe.qwen_asr 块
+    - xf_asr   → config.transcribe.xf_asr 块
+    由调用方 (cli/processor) 按 asr_engine 装好对应块再传入，避免「给 xf_asr 传 qwen_asr 配置」导致凭证缺失误降 mock。
+    """
     if asr_engine == "whisper":
         return transcribe_audio_with_whisper(audio_path, model_size, cpu_threads)
     if asr_engine == "funasr":
@@ -429,13 +435,13 @@ def transcribe_audio(
         os.environ.setdefault("HF_HOME", r"E:\AI_Models\Qwen3-ASR")
         # 延迟 import：避免未装 qwen_asr 时启动报错
         from .qwen_asr import transcribe_audio_with_qwen_asr
-        return transcribe_audio_with_qwen_asr(audio_path, qwen_asr_config or {})
+        return transcribe_audio_with_qwen_asr(audio_path, engine_config or {})
     if asr_engine == "xf_asr":
         # 2026-09-27 新增：讯飞听见云端识别 backend
         # 凭证缺失自动降级 mock（与 qwen_asr 保持一致的容错策略）
         # 延迟 import：避免未装 requests 时启动报错（pyproject 已固定 requests>=2.31）
         from .xf_asr import transcribe_audio_with_xf_asr
-        return transcribe_audio_with_xf_asr(audio_path, qwen_asr_config or {})
+        return transcribe_audio_with_xf_asr(audio_path, engine_config or {})
     raise ValueError(f"不支持的 ASR 引擎: {asr_engine}")
 
 

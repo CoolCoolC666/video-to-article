@@ -146,7 +146,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model-size", type=str, default="tiny", choices=["tiny", "base", "small"], help="Whisper 模型大小")
     parser.add_argument("--cpu-threads", type=int, default=4, help="CPU 线程数")
-    parser.add_argument("--asr-engine", type=str, default=None, choices=["funasr", "whisper", "qwen_asr"], help="语音转文字引擎，未指定时读 config.transcribe.asr_engine，默认 funasr")
+    parser.add_argument(
+        "--asr-engine",
+        type=str,
+        default=None,
+        choices=["funasr", "whisper", "qwen_asr", "xf_asr"],
+        help="语音转文字引擎，未指定时读 config.transcribe.asr_engine，默认 funasr"
+    )
     parser.add_argument(
         "--funasr-model",
         type=str,

@@ -23,7 +23,7 @@ if not os.path.exists(audio):
 from video_to_article.media import audio as am
 text = am.transcribe_audio(
     audio, asr_engine="xf_asr",
-    qwen_asr_config={"mock": True, "app_id": "", "secret_key": ""},
+    engine_config={"mock": True, "app_id": "", "secret_key": ""},
 )
 print(f"[e2e1] transcribe_audio(xf_asr, mock=True) -> {len(text)} chars")
 print(f"[e2e1] preview: {text[:60]}")

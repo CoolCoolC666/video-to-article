@@ -364,15 +364,58 @@ def _upload_audio(
 def _parse_result_content(content: dict) -> str:
     """解析 getResult 返回的 content，按时间顺序拼接文本。
 
-    讯飞 v2 API 的 content.resultMap 是个 dict：
-    - key = 句子 ID（"1", "2", "3", ... 按时间排序）
-    - value = {"text": "...", "begin_time": ms, "end_time": ms, ...}
+    2026-09-30 订正：response.content.orderResult 是 **JSON 字符串**（不是 dict）。
+
+    真实结构（caitongbo/Speech-to-Text Ifasr_new.py + csdn 多 demo 一致）：
+
+        orderResult_str (string)
+        └─ json.loads(orderResult_str)
+           └─ { "lattice": [...], "lattice2": [...], "label": {...} }
+              └─ lattice[] / lattice2[] (list of segments)
+                 └─ segment.json_1best (string OR dict，demo 两种写法都有)
+                    └─ json.loads(...) → {"st": {"rt": [{"ws": [{"cw": [{"w": "字"}]}]}]}}
+
+    兼容策略：
+    - lattice 优先（caitongbo 旧 demo），fallback 到 lattice2（csdn 新 demo）
+    - json_1best 兼容 string（caitongbo）和 dict（csdn）
+    - 每个段落的 ws[].cw[].w 拼接到 text_parts
     """
-    result_map = content.get("resultMap", {})
+    order_result_str = content.get("orderResult")
+    if not order_result_str:
+        return ""
+    try:
+        data1 = json.loads(order_result_str)
+    except (json.JSONDecodeError, TypeError) as exc:
+        # 防御性日志：HTTP layer 的 JSONDecodeError 已经先抓了一层，
+        # 这里只是兜底（空字符串 / 异常 payload），用 INFO 避免污染正常日志
+        logger.info(f"_parse_result_content 拿到非 JSON orderResult（防御性 fallback）: {exc}")
+        return ""
+    # 兼容 lattice（caitongbo）和 lattice2（csdn）
+    segments = data1.get("lattice2") or data1.get("lattice") or []
+    if not segments:
+        return ""
     text_parts = []
-    for sid in sorted(result_map.keys(), key=lambda k: int(k) if str(k).isdigit() else 0):
-        text_parts.append(result_map[sid].get("text", ""))
-    return "\n".join(text_parts)
+    for seg in segments:
+        json_1best_raw = seg.get("json_1best")
+        if json_1best_raw is None:
+            continue
+        # 兼容 string（caitongbo）和 dict（csdn）
+        if isinstance(json_1best_raw, str):
+            try:
+                json_1best = json.loads(json_1best_raw)
+            except json.JSONDecodeError:
+                continue
+        else:
+            json_1best = json_1best_raw
+        st = json_1best.get("st", {})
+        for rt in st.get("rt", []):
+            for ws in rt.get("ws", []):
+                for cw in ws.get("cw", []):
+                    if isinstance(cw, dict):
+                        w = cw.get("w")
+                        if w:
+                            text_parts.append(w)
+    return "".join(text_parts)
 
 
 def _poll_result(

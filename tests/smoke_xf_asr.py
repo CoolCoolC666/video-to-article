@@ -7,6 +7,9 @@ Covers:
   4. 长音频切段阈值逻辑（_split_audio_for_long）
   5. atexit 兜底清理 xf_asr_chunks_* tempdir
   6. SettingsDialog 读写 transcribe.xf_asr（GUI 字段不丢）
+  7. _upload_audio URL query string 契约（鉴权参数 + Content-Type）
+  8. _poll_result 状态码契约（status 3 处理中 / 4 完成 + content.orderInfo.status）
+  9. _parse_result_content orderResult 解析契约（caitongbo + csdn 双 demo 风格）
 
 从仓库根运行：python tests\\smoke_xf_asr.py
 """
@@ -445,6 +448,100 @@ def test_poll_result_status_codes():
     )
 
 
+def test_parse_result_content():
+    """10. _parse_result_content 解析 orderResult 契约（caitongbo + csdn demo 一致）。
+
+    2026-09-30 订正：之前的实现用 resultMap[sid].text，是完全错结构。
+    真实结构（caitongbo/Speech-to-Text Ifasr_new.py）：
+        orderResult 是 JSON 字符串，要 parse 后才能拿到 lattice/lattice2
+        每个 segment 的 json_1best 也是 JSON 字符串，要二次 parse
+        字在 ws[].cw[].w 里（不是 ws[].text）
+
+    user 实测三次都 KeyError 在 status==4 之前的轮询层，从未到 _parse_result_content，
+    这次主动加 smoke 验证契约，省一次 5.74MB 上传 + 配额消耗。
+    """
+    import video_to_article.media.xf_asr as xf
+
+    # === Case A: caitongbo 风格（json_1best 是字符串）===
+    # 真实 orderResult 子结构
+    caicongbo_inner_1 = json.dumps({
+        "st": {"rt": [{"ws": [{"cw": [{"w": "你"}, {"w": "好"}]}]}]}
+    })
+    caicongbo_inner_2 = json.dumps({
+        "st": {"rt": [{"ws": [{"cw": [{"w": "世"}, {"w": "界"}]}]}]}
+    })
+    order_result_caicongbo = json.dumps({
+        "lattice": [
+            {"json_1best": caicongbo_inner_1},
+            {"json_1best": caicongbo_inner_2},
+        ]
+    })
+    content_a = {"orderResult": order_result_caicongbo}
+    text_a = xf._parse_result_content(content_a)
+    assert text_a == "你好世界", (
+        f"caitongbo 风格应拼出 '你好世界'，实得 {text_a!r}"
+    )
+    print(f"OK 10a: caitongbo 风格（json_1best 是字符串）→ {text_a!r}")
+
+    # === Case B: csdn 风格（json_1best 已是 dict，含 spk/begin/end）===
+    order_result_csdn = json.dumps({
+        "lattice2": [
+            {
+                "lid": "0",
+                "begin": 0, "end": 1840,
+                "spk": "段落-0",
+                "json_1best": {
+                    "st": {
+                        "sc": "0.86", "pa": "0",
+                        "rt": [{
+                            "nb": "1", "nc": "1.0",
+                            "ws": [
+                                {"cw": [{"w": "这"}, {"w": "是"}, {"w": "一"}, {"w": "条"}, {"w": "测试"}]},
+                                {"cw": [{"w": "音频"}]},
+                                {"cw": [{"w": "。"}]},
+                            ]
+                        }],
+                        "bg": "50", "rl": "0", "ed": "1840",
+                    }
+                }
+            }
+        ]
+    })
+    content_b = {"orderResult": order_result_csdn}
+    text_b = xf._parse_result_content(content_b)
+    assert text_b == "这是一条测试音频。", (
+        f"csdn 风格应拼出 '这是一条测试音频。'，实得 {text_b!r}"
+    )
+    print(f"OK 10b: csdn 风格（json_1best 已是 dict + 含 spk/lattice2）→ {text_b!r}")
+
+    # === Case C: 防御性 —— 空 / 缺字段 / 非 JSON ===
+    assert xf._parse_result_content({}) == "", "空 content 应返回空字符串"
+    assert xf._parse_result_content({"orderResult": ""}) == "", "空 orderResult 应返回空字符串"
+    assert xf._parse_result_content({"orderResult": "not json"}) == "", (
+        "非 JSON orderResult 不应崩，应返回空字符串"
+    )
+    # 看起来是 dict 但没有 lattice/lattice2
+    empty_order = json.dumps({"lattice": [], "lattice2": []})
+    assert xf._parse_result_content({"orderResult": empty_order}) == "", (
+        "空 lattice 数组应返回空字符串"
+    )
+    print("OK 10c: 防御性 case（空/非 JSON/空数组）→ 全部返回空字符串不崩")
+
+    # === Case D: 混合结构（lattice 字段缺失但 lattice2 有，应回退用 lattice2）===
+    mixed = json.dumps({
+        "lattice2": [{
+            "json_1best": json.dumps({"st": {"rt": [{"ws": [{"cw": [{"w": "回"}, {"w": "退"}]}]}]}})
+        }]
+    })
+    text_d = xf._parse_result_content({"orderResult": mixed})
+    assert text_d == "回退", (
+        f"lattice 缺失时 fallback 到 lattice2 应拼出 '回退'，实得 {text_d!r}"
+    )
+    print(f"OK 10d: lattice 缺失 fallback lattice2 → {text_d!r}")
+
+    print("OK 10: _parse_result_content 解析契约对（caitongbo + csdn + 防御 + fallback）\n")
+
+
 def _make_test_audio(seconds: int = 3) -> str:
     """生成一个测试用 wav（用 ffmpeg 合成静音）。失败时返回任意 wav。"""
     import subprocess
@@ -488,6 +585,7 @@ if __name__ == "__main__":
     test_settings_dialog_xf_asr_roundtrip()
     test_upload_url_format()
     test_poll_result_status_codes()
+    test_parse_result_content()
     print("=" * 50)
     print("ALL xf_asr smoke tests passed ✓")
     print("=" * 50)

@@ -67,9 +67,12 @@ _FFPROBE_PATHS = [
 ]
 
 # 讯飞任务状态码
-_STATUS_PROCESSING = frozenset({0, 1, 2, 3, 4})  # 仍在处理中
-_STATUS_UPLOADED = 9                                # 上传完成未出结果
-_STATUS_SUCCESS = 5                                 # 处理完成
+# 讯飞 raasr v2 API 任务状态码（参考 caitongbo/3drx.top/szfx.top demo 一致）：
+#   - status = 3 → 仍在处理中（demo while status == 3: ... time.sleep(5)）
+#   - status = 4 → 处理完成（demo if status == 4: break）
+# 2026-09-30 订正：之前误写 0-4/9/5，全部错。
+_STATUS_PROCESSING = frozenset({3})
+_STATUS_SUCCESS = 4
 
 # 模块级 cache：HTTP Session 复用（多段上传共用连接池）
 _cached_session: Optional[object] = None
@@ -424,9 +427,12 @@ def _poll_result(
                 f"讯飞 getResult 失败 (code={result.get('code')}): "
                 f"{result.get('descInfo', '')}"
             )
-        status = int(result["content"]["taskStatus"])
+        # 2026-09-30 订正：响应结构是 content.orderInfo.status，不是 content.taskStatus
+        # demo 一致：caicongbo / 3drx.top / szfx.top 都是 result['content']['orderInfo']['status']
+        # user 实测 KeyError: 'taskStatus'（2026-09-30 22:08）
+        status = int(result["content"]["orderInfo"]["status"])
         logger.info(f"poll #{attempt}: status={status}")
-        if status in _STATUS_PROCESSING or status == _STATUS_UPLOADED:
+        if status in _STATUS_PROCESSING:
             time.sleep(poll_interval)
             continue
         if status == _STATUS_SUCCESS:

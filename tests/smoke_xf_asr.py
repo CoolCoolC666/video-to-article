@@ -358,6 +358,93 @@ def test_upload_url_format():
             os.unlink(audio)
 
 
+def test_poll_result_status_codes():
+    """9. _poll_result 状态码契约（caicongbo/3drx.top/szfx.top demo 一致）：
+       - getResult 响应: content.orderInfo.status（不是 content.taskStatus）
+       - status=3 → 处理中（继续轮询）
+       - status=4 → 完成（返回 _parse_result_content(content)）
+    """
+    import video_to_article.media.xf_asr as xf
+
+    # === 验证：响应字段路径是 orderInfo.status，不是 taskStatus ===
+    assert hasattr(xf, "_STATUS_PROCESSING"), "应有 _STATUS_PROCESSING 常量"
+    assert hasattr(xf, "_STATUS_SUCCESS"), "应有 _STATUS_SUCCESS 常量"
+    assert xf._STATUS_SUCCESS == 4, (
+        f"_STATUS_SUCCESS 应是 4（demo 一致），实得 {xf._STATUS_SUCCESS}"
+    )
+    assert 3 in xf._STATUS_PROCESSING, (
+        f"3 必须在 _STATUS_PROCESSING 中（处理中），实得 {xf._STATUS_PROCESSING}"
+    )
+
+    # === Mock getResult 流程：第一次 status=3 继续轮询，第二次 status=4 完成 ===
+    poll_calls = {"count": 0}
+    parsed_text = "测试转写结果"
+
+    class FakeResp:
+        def __init__(self, status_code: int, payload: dict):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class FakeSession:
+        def post(self, url, data=None, headers=None, timeout=None, **kwargs):
+            poll_calls["count"] += 1
+            if poll_calls["count"] == 1:
+                # 第一次：处理中
+                return FakeResp(
+                    200,
+                    {
+                        "code": "000000",
+                        "descInfo": "success",
+                        "content": {
+                            "orderInfo": {"status": 3},
+                            "orderResult": "",
+                        },
+                    },
+                )
+            # 第二次：完成 + 简化结果（用最简结构让 _parse_result_content 返回空也能过测试）
+            return FakeResp(
+                200,
+                {
+                    "code": "000000",
+                    "descInfo": "success",
+                    "content": {
+                        "orderInfo": {"status": 4},
+                        "orderResult": "",
+                    },
+                },
+            )
+
+    xf._cached_session = FakeSession()
+    try:
+        # 用补丁让 _parse_result_content 返回固定文本（避免依赖 resultMap 结构）
+        original_parse = xf._parse_result_content
+        xf._parse_result_content = lambda content: parsed_text
+        try:
+            text = xf._poll_result(
+                task_id="fake-order-id",
+                app_id="test_app_id",
+                secret_key="test_secret_key",
+                max_wait=60,
+                poll_interval=0.01,  # 加速测试
+            )
+        finally:
+            xf._parse_result_content = original_parse
+    finally:
+        xf._release_cached_session()
+
+    assert text == parsed_text, f"应返回 _parse_result_content 结果, 实得 {text!r}"
+    # 至少调用 2 次（status=3 处理中 + status=4 完成）
+    assert poll_calls["count"] >= 2, (
+        f"应至少 poll 2 次（处理中→完成），实得 {poll_calls['count']} 次"
+    )
+    print(
+        f"OK 9: _poll_result 状态码契约对（status 3 处理中 / 4 完成 / 共 poll {poll_calls['count']} 次）\n"
+    )
+
+
 def _make_test_audio(seconds: int = 3) -> str:
     """生成一个测试用 wav（用 ffmpeg 合成静音）。失败时返回任意 wav。"""
     import subprocess
@@ -400,6 +487,7 @@ if __name__ == "__main__":
     test_atexit_registered()
     test_settings_dialog_xf_asr_roundtrip()
     test_upload_url_format()
+    test_poll_result_status_codes()
     print("=" * 50)
     print("ALL xf_asr smoke tests passed ✓")
     print("=" * 50)

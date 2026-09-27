@@ -210,16 +210,22 @@ python packaging/make_models_funasr_zip.py
 
 ### 新增：讯飞听见云端识别（xf_asr）
 
-fork **新增** `src/video_to_article/media/xf_asr.py`（~330 行），提供 `transcribe_audio_with_xf_asr()` 接口：
+fork **新增** `src/video_to_article/media/xf_asr.py`（~590 行），提供 `transcribe_audio_with_xf_asr()` 接口，**真实 API 已跑通**（2026-09-27：5.74MB / 25 分钟 mp3 实测转写成功落盘 `raw.md`）。
 
 | 改动 | 内容 | 为什么改 |
 |------|------|----------|
-| **长语音转写 REST API** | 调 `https://raasr.xfyun.cn/v2/api/upload` + `getResult` 两步，HMAC-SHA1 签名 | 上游没有云端 ASR backend，本地 FunASR/Qwen3-ASR 在噪声大 / 方言 / 多人对话场景识别率不够 |
-| **鉴权只用 APPID + SecretKey 两件套** | 长语音 lfasr / ifasr_new 签名算法 `signa = base64(HMAC-SHA1(secret_key, f"{app_id}{ts}"))`，**不**需要 APIKey | APIKey 是短音频 ifasr 实时接口的字段，长语音 lfasr 控制台只下发 APPID + SecretKey |
+| **长语音转写 REST API** | 调 `https://raasr.xfyun.cn/v2/api/upload` + `getResult` 两步 | 上游没有云端 ASR backend，本地 FunASR/Qwen3-ASR 在噪声大 / 方言 / 多人对话场景识别率不够 |
+| **鉴权签名（MD5 + HMAC-SHA1 + base64）** | `signa = base64(HMAC-SHA1(secret_key, MD5(app_id + ts).hexdigest()))`——**漏 MD5 一步** server 报 26601 `signa verify fail` | 长语音 lfasr 鉴权算法，按 [caitongbo/Speech-to-Text](https://github.com/caitongbo/Speech-to-Text) 等 5+ demo 一致实现 |
+| **鉴权只用 APPID + SecretKey 两件套** | 长语音 lfasr 控制台只下发 APPID + SecretKey，**不**需要 APIKey | APIKey 是短音频 ifasr 实时接口的字段，GUI 多加它是常见错误 |
+| **upload 用 URL query string + raw bytes（不 multipart）** | 鉴权参数（`appId`/`signa`/`ts`/`fileSize`/`fileName`/`sliceSize`/`language`/`duration`）全在 URL query，body 是 raw 音频字节，`Content-Type: application/json` | `requests.post(files=...)` 走 multipart，讯飞返回 26600「音频使用表单方式上传」——中文错误描述是「别走 multipart」的反向提示 |
+| **upload 必传 `duration` 字段** | `duration = str(int(audio_duration_seconds))`，demo 一致必填 | 漏传 server 仍报 26600 |
+| **getResult 响应字段** | `content.orderInfo.status`（**不是** `content.taskStatus`），状态码 `{3}` 处理中 / `4` 完成 | 之前 demo 反推错字段名 + 状态码常量，搞了 4 个 KeyError 才订正 |
+| **订单 ID 字段** | `content.orderId`（**不是** `content.taskId`） | upload 成功后 `result["content"]["orderId"]`，query getResult 时回传 `orderId` |
+| **orderResult 双重 json.loads** | `content.orderResult` 是 **JSON 字符串**（不是 dict），外层 parse 后拿 `lattice[]`/`lattice2[]`；每个 segment 的 `json_1best` 又是字符串或 dict，再 parse 后拿 `st.rt[].ws[].cw[].w` | 之前按猜的 `resultMap[sid].text` 实现是纯错；按 caitongbo（字符串）+ csdn（dict）两个 demo 双重兼容 |
 | **Mock 模式（默认开启）** | 凭证缺失或显式 `mock=true` 时返回 fake 中文文本，不调网络 | 无凭证也能跑通流程 + GUI 验证，避免启动时悄悄调 API 失败 |
-| **长音频自动切段** | > 7.5 分钟切 5 分钟一段，逐段 upload + poll，最后拼接 | 讯飞单文件 ≤500MB / 5h；长视频超限必切 |
-| **atexit 兜底清理** | 进程退出清残留 `xf_asr_chunks_*` tempdir | GUI 强杀 / 进程崩溃场景 |
-| **requests.Session cache** | 模块级 session 复用连接池 | 多段上传不每次重连 |
+| **长音频客户端不切段** | 客户端整段直传，讯飞 server 自己处理长音频（≤500MB / 5h） | 客户端切 wav 头丢失 + 边界静音问题反而引入失败；server 端 OK 不切更稳 |
+| **atexit 兜底清理** | 进程退出清残留 `xf_asr_chunks_*` tempdir | GUI 强杀 / 进程崩溃场景（虽然现在不切段，保留兜底） |
+| **requests.Session cache** | 模块级 session 复用连接池 | upload + poll 多次复用 TCP 连接 |
 
 **配置位置**：「设置 → 转写 → 讯飞听见 高级」GroupBox。CLI 用 `--asr-engine xf_asr`。
 
@@ -240,6 +246,20 @@ fork **新增** `src/video_to_article/media/xf_asr.py`（~330 行），提供 `t
 #### 残留冗余字段自动清理
 
 旧版本（6 字段）遗留的 `xf_asr.api_key` 字段在 2026-09-27 重构后**不再读取也不再写出**，但磁盘 config.json 可能还残留。下次点 GUI 「保存设置」时 `_save()` 会自动 `xf_asr.pop("api_key", None)` 清理冗余字段。
+
+#### 真实 API 跑通的契约订正过程（开发者参考）
+
+xf_asr 集成期间按以下顺序踩坑订正协议层（每个 fix 都加 smoke test 防回归，共 10 个测试）：
+
+| Commit | 现象 | 根因 | 修法 |
+|--------|------|------|------|
+| `b1b585e` | 真实 API 返回 26600 | `requests.post(files=...)` 走 multipart | URL query string + raw bytes + `Content-Type: application/json` |
+| `8656f38` | 仍 26600（切段 wav 头丢失 + duration 缺失） | 客户端过度切段 + 漏传 `duration` | 关闭 `_split_audio_for_long` 切段，加 `duration` 字段 |
+| `1a40f6f` | 上传成功拿到 order_id，但 `KeyError 'taskId'` | 协议层用错键名 | `result["content"]["orderId"]`（讯飞拼写） |
+| `60be01f` | poll 启动后撞 `KeyError 'taskStatus'` | 响应字段路径猜错 + 状态码常量错 | `content.orderInfo.status`（3 处理中 / 4 完成）+ 状态码常量订正 |
+| `cee2c11` | status=4 后 `_parse_result_content` 仍可能 KeyError | `resultMap[sid].text` 是猜的，实际 `orderResult` 是 JSON 字符串 + lattice/lattice2 双重 parse | `json.loads(orderResult)` + 兼容 `lattice`（caitongbo）+ `lattice2`（csdn）+ `json_1best` 字符串/dict 双重兼容 |
+
+教训：参照 demo 写代码必须字段名 / 路径 / 常量全对齐，**不能凭直觉**；每订正一处加 smoke test 验证契约不回归。
 
 ### Qwen3-ASR 引擎的健壮性增强
 
@@ -268,9 +288,9 @@ fork **新增** `src/video_to_article/media/xf_asr.py`（~330 行），提供 `t
 
 ### 测试 / 工程
 
-- **6 个 smoke 脚本移到 `tests/`**（`smoke_settings / fallback / language / jp_kr / release / cleanup`）
-  - 验证 GUI 字段读写、device fallback、language 兜底、释放按钮、清理按钮
-  - 6 套全过，共 16+ 断言
+- **9 个 smoke 脚本移到 `tests/`**（`smoke_settings / fallback / language / jp_kr / release / cleanup / thinking / xf_asr / xf_e2e`）
+  - 验证 GUI 字段读写、device fallback、language 兜底、释放按钮、清理按钮、xf_asr 鉴权签名 / upload 协议 / poll 状态码 / orderResult 解析契约
+  - 9 套全过，共 50+ 断言
   - `tests/README.md` 说明运行方式（从仓库根跑）
 - **`.gitignore` 加严**：
   - 新增 `pip-unpack-*/` `run_e2e_main.log` `__tmp_*` `*.bak` `config.json.bak*`

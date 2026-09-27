@@ -275,7 +275,7 @@ def test_upload_url_format():
         status_code = 200
         text = (
             '{"code":"000000","descInfo":"success",'
-            '"content":{"taskId":"fake-task-id-abc123"}}'
+            '"content":{"orderId":"fake-order-id-abc123"}}'
         )
 
         def json(self):
@@ -348,7 +348,7 @@ def test_upload_url_format():
             f"data 字节不匹配文件实际内容（multipart/截断嫌疑）"
         )
 
-        assert task_id == "fake-task-id-abc123", f"task_id 错: {task_id}"
+        assert task_id == "fake-order-id-abc123", f"task_id 错: {task_id}"
         print(
             "OK 8: _upload_audio 用 URL query string + raw bytes（不 multipart files）\n"
         )

@@ -351,7 +351,9 @@ def _upload_audio(
             f"讯飞 upload 失败 (code={result.get('code')}): "
             f"{result.get('descInfo', '')}"
         )
-    task_id = result["content"]["taskId"]
+    # 2026-09-30 订正：JSON key 是 orderId，不是 taskId（讯飞文档拼写）
+    # user 实测报 KeyError: 'taskId'（2026-09-30 22:06 截图）——所有 demo 一致用 orderId
+    task_id = result["content"]["orderId"]
     logger.info(f"上传成功，task_id={task_id}")
     return task_id
 
@@ -398,7 +400,7 @@ def _poll_result(
             "appId": app_id,
             "signa": signa,
             "ts": str(ts),
-            "taskId": task_id,
+            "orderId": task_id,  # 2026-09-30 订正：JSON 字段是 orderId
         }
         try:
             resp = session.post(_RESULT_URL, data=form_data, timeout=30)

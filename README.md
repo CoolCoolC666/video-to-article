@@ -222,6 +222,11 @@ fork **新增** `src/video_to_article/media/xf_asr.py`（~590 行），提供 `t
 | **getResult 响应字段** | `content.orderInfo.status`（**不是** `content.taskStatus`），状态码 `{3}` 处理中 / `4` 完成 | 之前 demo 反推错字段名 + 状态码常量，搞了 4 个 KeyError 才订正 |
 | **订单 ID 字段** | `content.orderId`（**不是** `content.taskId`） | upload 成功后 `result["content"]["orderId"]`，query getResult 时回传 `orderId` |
 | **orderResult 双重 json.loads** | `content.orderResult` 是 **JSON 字符串**（不是 dict），外层 parse 后拿 `lattice[]`/`lattice2[]`；每个 segment 的 `json_1best` 又是字符串或 dict，再 parse 后拿 `st.rt[].ws[].cw[].w` | 之前按猜的 `resultMap[sid].text` 实现是纯错；按 caitongbo（字符串）+ csdn（dict）两个 demo 双重兼容 |
+| **说话人分离**（可关） | 勾选后 upload 带 `roleType=1` + `roleNum=N`，每段加 `【说话人1】` 标签 | 两人对话（访谈 / 对话课 / 师生问答）需要区分谁在说。标准版 lfasr 只支持 `roleType=1`；`roleNum=0` 自动盲分，1-10 指定人数 |
+| **时间戳输出**（可关） | 每段加 `[MM:SS]` 前缀（读 `st.bg` / `lattice2.begin`，本来就在响应里只是之前没解析）；超 1 小时自动带小时位 | 做文章时定位段落、核对哪段说错了很方便 |
+| **垂直领域优化** | `pd=edu` / `court` / `finance` / `medical` / `tech` / `sport` / `gov` / `game` / `ecom` / `car`，默认 `edu` | 讯飞为各领域准备了定制声学+语言模型，`edu` 对课堂实录术语识别率提升最明显 |
+| **口语规整**（可关） | `eng_colloqproc=true`，自动去「嗯/啊/呃」+ 口癖重复 | 课堂实录/访谈口癖多，去掉后给下游 LLM 成稿的文本干净很多。零成本零权限 |
+| **增强参数失败自动降级** | 增强参数被账号拒绝（`26600`/`26610`）时自动退回最小参数集重试一次，只打 WARNING 不中断转写 | 官方 Java SDK 明写 `role_type`「只有在开通了角色分离功能的前提下才会生效」——可选能力不能变成硬失败 |
 | **Mock 模式（默认开启）** | 凭证缺失或显式 `mock=true` 时返回 fake 中文文本，不调网络 | 无凭证也能跑通流程 + GUI 验证，避免启动时悄悄调 API 失败 |
 | **长音频客户端不切段** | 客户端整段直传，讯飞 server 自己处理长音频（≤500MB / 5h） | 客户端切 wav 头丢失 + 边界静音问题反而引入失败；server 端 OK 不切更稳 |
 | **atexit 兜底清理** | 进程退出清残留 `xf_asr_chunks_*` tempdir | GUI 强杀 / 进程崩溃场景（虽然现在不切段，保留兜底） |
@@ -261,6 +266,25 @@ xf_asr 集成期间按以下顺序踩坑订正协议层（每个 fix 都加 smok
 
 教训：参照 demo 写代码必须字段名 / 路径 / 常量全对齐，**不能凭直觉**；每订正一处加 smoke test 验证契约不回归。
 
+#### 说话人分离：讯飞支持 / Qwen3-ASR 不支持（2026-10-02 实测查证）
+
+想在转写里区分「谁在说话」，四个引擎的能力**不一样**：
+
+| 引擎 | 说话人分离 | 说明 |
+|------|-----------|------|
+| **xf_asr（讯飞）** | ✅ 支持 | 需账号开通「角色分离」权限；未开通时本 fork 自动降级不报错 |
+| **qwen_asr（Qwen3-ASR）** | ❌ **不支持** | 多个独立实测一致：「目前版本不支持自动说话人分离，会把多人对话识别为连续文本」；官方把「需要说话人分离的会议记录」列为谨慎使用场景 |
+| **funasr** | ⚠️ 需额外挂 CAM++ | 单独 `AutoModel(..., spk_model="cam++")` 才能分离，SenseVoice 自身不产角色号。本 fork 暂未接 |
+| **whisper** | ❌ 不支持 | 需外挂 pyannote 等第三方模型 |
+
+> **Qwen3-ASR 实测原文**（两处独立来源一致）：
+> 「Qwen3-ASR目前版本不支持自动说话人分离。它会把多人对话识别为连续的文本,不区分不同的说话者。」
+> 「4人圆桌讨论（含打断、抢话、语气词），模型未做说话人分离，但通过上下文连贯性，将发言逻辑自动归并为段落」
+>
+> 来源：[Qwen3-ASR 服务实测](https://blog.csdn.net/)、[Qwen3-ASR-0.6B 实测](https://blog.csdn.net/weixin_36296444/article/details/157788729)
+
+**关于「省算力」的澄清**：xf_asr 的说话人分离是**云端**能力，不占本地 GPU，开关的意义是「要不要为这个能力承担不准确风险」；Qwen3-ASR 是**根本做不到**，开关没意义；真要在本地分离只能上 FunASR + CAM++，那才会多占显存——如果哪天要接，算力开关做在那条路上。
+
 ### Qwen3-ASR 引擎的健壮性增强
 
 | 改动 | 内容 | 为什么改 |
@@ -289,8 +313,8 @@ xf_asr 集成期间按以下顺序踩坑订正协议层（每个 fix 都加 smok
 ### 测试 / 工程
 
 - **9 个 smoke 脚本移到 `tests/`**（`smoke_settings / fallback / language / jp_kr / release / cleanup / thinking / xf_asr / xf_e2e`）
-  - 验证 GUI 字段读写、device fallback、language 兜底、释放按钮、清理按钮、xf_asr 鉴权签名 / upload 协议 / poll 状态码 / orderResult 解析契约
-  - 9 套全过，共 50+ 断言
+  - 验证 GUI 字段读写、device fallback、language 兜底、释放按钮、清理按钮、xf_asr 鉴权签名 / upload 协议 / poll 状态码 / orderResult 解析 / 说话人分离 / 增强参数降级
+  - 9 套全过，共 60+ 断言
   - `tests/README.md` 说明运行方式（从仓库根跑）
 - **`.gitignore` 加严**：
   - 新增 `pip-unpack-*/` `run_e2e_main.log` `__tmp_*` `*.bak` `config.json.bak*`

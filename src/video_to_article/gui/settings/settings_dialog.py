@@ -181,6 +181,54 @@ class SettingsDialog(QDialog):
         form.addRow(self.tr_auto)
         outer.addWidget(base)
 
+        # === 2026-10-02 新增：FunASR 高级（本地说话人分离）===
+        fs_box = QGroupBox("FunASR 高级（funasr 引擎专用）")
+        fsform = QFormLayout(fs_box)
+
+        self.funasr_speaker = QCheckBox("分离说话人（本地 CAM++，标注【说话人1】…）")
+        self.funasr_speaker.setToolTip(
+            "开启后给 FunASR 挂载 CAM++ 说话人嵌入模型（spk_model=\"cam++\"），\n"
+            "输出每段带【说话人N】标签。适合两人对话（访谈 / 对话课 / 师生问答）。\n\n"
+            "· 完全本地：不调网络、不花云端额度\n"
+            "· 开销小：CAM++ 是 ~28MB 的嵌入模型（非生成式），CPU 即可跑、不占 GPU 显存\n"
+            "· 首次开启会从 ModelScope 下载约 28MB 到 FunASR 缓存目录\n"
+            "· spk=0 是匿名的录音内标签，不是跨录音稳定的人员 ID\n"
+            "· 单人说话时开启没有意义（会全部标成同一个人）"
+        )
+        self.funasr_speaker.toggled.connect(self._on_funasr_speaker_toggled)
+
+        self.funasr_spk_model = QComboBox()
+        self.funasr_spk_model.addItem("CAM++（cam++，中文 16k 通用，推荐）", "cam++")
+        self.funasr_spk_model.setToolTip(
+            "说话人嵌入模型。目前只接入 CAM++（iic/speech_campplus_sv_zh-cn_16k-common），\n"
+            "这是 FunASR 官方 demo 唯一演示的说话人模型。\n"
+            "若要换 ERes2NetV2 等，需要同步改 audio.py 的 CAMPLUS 目录/完整性检查。"
+        )
+
+        self.funasr_timestamps = QCheckBox("输出时间戳（每段加 [MM:SS] 前缀）")
+        self.funasr_timestamps.setChecked(True)
+        self.funasr_timestamps.setToolTip(
+            "开启后每段前面加 [MM:SS] 时间戳（读 FunASR sentence_info 的 start 字段）。\n"
+            "与 xf_asr 的时间戳格式保持一致，方便横向对比。"
+        )
+
+        fsform.addRow(self.funasr_speaker)
+        fsform.addRow("说话人模型", self.funasr_spk_model)
+        fsform.addRow(self.funasr_timestamps)
+        outer.addWidget(fs_box)
+
+        fs_tip = QLabel(
+            "💡 本地说话人分离（FunASR + CAM++）：\n"
+            "  · 完全离线，不消耗任何云端额度，也不把音频传出本机\n"
+            "  · SenseVoice 自身不产角色号，必须额外挂 CAM++ 嵌入模型（spk_model 参数）\n"
+            "  · FunASR 官方约束：spk_model 必须与 vad_model 一起传（聚类在 VAD 流水线里做）\n"
+            "  · 拿不到 sentence_info 时自动退回纯文本，不会中断转写\n"
+            "  · 对比：Qwen3-ASR 完全不支持说话人分离；讯飞 xf_asr 支持但是云端能力"
+        )
+        fs_tip.setWordWrap(True)
+        fs_tip.setStyleSheet("color: #666; font-size: 11px;")
+        outer.addWidget(fs_tip)
+
         # Qwen3-ASR 高级
         qwen_box = QGroupBox("Qwen3-ASR 高级（qwen_asr 引擎专用）")
         qform = QFormLayout(qwen_box)
@@ -449,6 +497,10 @@ class SettingsDialog(QDialog):
         """
         self.xf_role_num.setEnabled(bool(checked))
 
+    def _on_funasr_speaker_toggled(self, checked: bool) -> None:
+        """2026-10-02：本地说话人分离开关 → 模型下拉随之 enable/disable。"""
+        self.funasr_spk_model.setEnabled(bool(checked))
+
     def _pick_qwen_context(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -659,6 +711,14 @@ class SettingsDialog(QDialog):
             str(tr.get("funasr_cache_dir") or tr.get("funasr_dir") or "")
         )
 
+        # 2026-10-02：FunASR 本地说话人分离（先设 enable 再设值，避免 toggle 抢跑）
+        self.funasr_spk_model.setEnabled(bool(tr.get("funasr_speaker", False)))
+        self.funasr_speaker.setChecked(bool(tr.get("funasr_speaker", False)))
+        fspk = str(tr.get("funasr_spk_model") or "cam++")
+        fsidx = self.funasr_spk_model.findData(fspk)
+        self.funasr_spk_model.setCurrentIndex(fsidx if fsidx >= 0 else 0)
+        self.funasr_timestamps.setChecked(bool(tr.get("funasr_timestamps", True)))
+
         # Qwen3-ASR 高级子块（独立于 funasr 字段）
         qa = (tr.get("qwen_asr") or {})
         mid = str(qa.get("model_id") or "Qwen/Qwen3-ASR-0.6B")
@@ -798,6 +858,10 @@ class SettingsDialog(QDialog):
                 "cpu_threads": self.tr_threads.value(),
                 "auto_optimize": self.tr_auto.isChecked(),
                 "funasr_cache_dir": self.tr_funasr_dir.text().strip(),
+                # 2026-10-02：本地说话人分离（FunASR + CAM++）
+                "funasr_speaker": self.funasr_speaker.isChecked(),
+                "funasr_spk_model": self.funasr_spk_model.currentData() or "cam++",
+                "funasr_timestamps": self.funasr_timestamps.isChecked(),
                 "qwen_asr": {
                     "model_id": self.qwen_model.currentData()
                     or "Qwen/Qwen3-ASR-0.6B",

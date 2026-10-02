@@ -25,8 +25,10 @@ __all__ = [
     "transcribe_audio_with_qwen_asr",
     "transcribe_audio_with_xf_asr",
     "extract_funasr_text",
+    "format_funasr_speaker_text",
     "resolve_funasr_model_name",
     "resolve_funasr_vad_model_name",
+    "resolve_funasr_spk_model_name",
 ]
 
 FUNASR_MODEL_ALIASES = {
@@ -35,6 +37,26 @@ FUNASR_MODEL_ALIASES = {
     "paraformer": "paraformer-zh",
     "paraformer-zh": "paraformer-zh",
 }
+
+# 2026-10-02 新增：说话人分离模型（speaker diarization）
+# SenseVoice 自身不产角色号，必须额外挂一个说话人嵌入模型（spk_model）。
+# 官方 demo 一致写法：AutoModel(model=..., vad_model="fsmn-vad", spk_model="cam++")
+# 关键约束（FunASR 官方文档原文）：「通用 AutoModel 说话人聚类位于 VAD 流水线中，
+# 只设置 spk_model 或 return_spk_res=True 不会给直接推理增加说话人分离」
+# → 所以 spk_model 必须和 vad_model 一起传（本项目的 vad_model 本来就有）。
+#
+# ⚠ 关于算力：CAM++ 只是 ~28MB 的说话人嵌入模型（不是生成式大模型），
+# CPU 上就能跑，不占 GPU 显存。开启分离的额外开销 ≈ 多一个模型加载 + 一次聚类。
+FUNASR_SPK_ALIASES = {
+    "cam++": "cam++",
+    "campplus": "cam++",
+    "camplus": "cam++",
+    "": "",
+}
+
+# CAM++ 本地快照的 ModelScope 目录名
+CAMPLUS_DIR_NAME = "speech_campplus_sv_zh-cn_16k-common"
+CAMPLUS_REQUIRED_FILES = ("model.pt", "config.yaml")
 
 # Required beside model.pt for SenseVoice (sentencepiece); used for completeness checks.
 SENSEVOICE_REQUIRED_FILES = (
@@ -108,6 +130,14 @@ def _project_sensevoice_dir() -> Path:
 
 def _project_vad_dir() -> Path:
     return FUNASR_MODEL_DIR / "models" / "iic" / "speech_fsmn_vad_zh-cn-16k-common-pytorch"
+
+
+def _project_camplus_dir() -> Path:
+    return FUNASR_MODEL_DIR / "models" / "iic" / CAMPLUS_DIR_NAME
+
+
+def _camplus_complete(dir_path: Path) -> bool:
+    return all((dir_path / name).is_file() for name in CAMPLUS_REQUIRED_FILES)
 
 
 def _sensevoice_complete(dir_path: Path) -> bool:
@@ -323,6 +353,141 @@ def resolve_funasr_vad_model_name() -> str:
     return "fsmn-vad"
 
 
+def resolve_funasr_spk_model_name(spk_model: str = "cam++") -> str:
+    """解析说话人分离模型（CAM++），优先用本地已下载的快照。
+
+    返回值可直接喂给 `AutoModel(spk_model=...)`：
+      - 本地有完整快照 → 返回绝对路径（ASCII 优先，避免中文路径问题）
+      - 本地没有 / 不完整 → 返回模型 ID "cam++"，让 FunASR 自己从 ModelScope 拉
+      - spk_model 为空串 → 返回空串（表示不分离，调用方不该传 spk_model 参数）
+    """
+    resolved = FUNASR_SPK_ALIASES.get((spk_model or "").strip().lower(), spk_model or "")
+    if not resolved:
+        return ""
+
+    candidates = [
+        funasr_runtime_root() / "models" / "iic" / CAMPLUS_DIR_NAME,
+        _project_camplus_dir(),
+    ]
+    seen: set[str] = set()
+    for cand in candidates:
+        key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _camplus_complete(cand):
+            path_str = str(cand.absolute())
+            if _path_has_non_ascii(path_str):
+                safe = funasr_runtime_root() / "models" / "iic" / CAMPLUS_DIR_NAME
+                if _camplus_complete(safe) and not _path_has_non_ascii(safe):
+                    return str(safe.absolute())
+                logger.warning(
+                    "本地 CAM++ 位于含非 ASCII 的路径，回退为模型 ID 以便下载到 ASCII 缓存: %s",
+                    path_str,
+                )
+                return resolved
+            return path_str
+
+    incomplete = _project_camplus_dir()
+    if (incomplete / "model.pt").exists() and not _camplus_complete(incomplete):
+        logger.warning(
+            "本地 CAM++ 不完整（缺少 %s），将尝试从 ModelScope 重新拉取",
+            ", ".join(f for f in CAMPLUS_REQUIRED_FILES if not (incomplete / f).is_file()),
+        )
+    return resolved
+
+
+_RICH_TAG_RE = None
+
+
+def _strip_rich_tags(text: str) -> str:
+    """去掉 SenseVoice 富标签（`<|zh|><|NEUTRAL|><|Speech|><|withitn|>` 等）。
+
+    官方 `rich_transcription_postprocess` 做的是同一件事，但它是有损的展示函数
+    （还会合并重复标记 + 文本替换）。这里只做最小必要的去标签，避免把
+    【说话人N】/时间戳排版弄乱，且不改动既有非分离路径的行为。
+    """
+    global _RICH_TAG_RE
+    if _RICH_TAG_RE is None:
+        import re
+
+        _RICH_TAG_RE = re.compile(r"<\|[^|]*\|>")
+    return _RICH_TAG_RE.sub("", text or "")
+
+
+def _format_ms(ms: int) -> str:
+    """毫秒 → [MM:SS]（超过 1 小时才带小时位）。与 xf_asr 的格式保持一致。"""
+    if ms <= 0:
+        return "00:00"
+    total = ms // 1000
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def format_funasr_speaker_text(result, timestamps: bool = True) -> str:
+    """把 FunASR + CAM++ 的 generate 结果格式化成带说话人/时间戳的文本。
+
+    CAM++ 生效时 FunASR 会在结果里给 `sentence_info`，每项形如：
+        {"spk": 0, "start": 3200, "end": 7000, "text": "你好", "sentence": "你好"}
+
+    ⚠ 官方两处 demo 用了**不同的键名**：
+        funasr.com/blog       → `s["sentence"]`
+        funasr.com/go/sensevoice → `sent["text"]`
+      所以这里两个键都读，谁在用都行。
+
+    输出示例（两个开关都开）：
+        [00:03] 【说话人1】你好我是老师
+        [01:05] 【说话人2】老师好我是学生
+
+    没有 `sentence_info`（CAM++ 没生效 / 老版本 FunASR）→ 返回空串，
+    由调用方退回 `extract_funasr_text()` 的纯文本路径。
+    """
+    if not isinstance(result, list) or not result:
+        return ""
+    first = result[0] if isinstance(result[0], dict) else None
+    if first is None:
+        return ""
+    sentences = first.get("sentence_info")
+    if not isinstance(sentences, list) or not sentences:
+        return ""
+
+    # 角色编号 → 连续编号（spk=0/1 映射成 说话人1/说话人2）
+    order: list = []
+    for sent in sentences:
+        if not isinstance(sent, dict):
+            continue
+        spk = sent.get("spk")
+        if spk is not None and spk not in order:
+            order.append(spk)
+    speaker_map = {spk: f"说话人{i + 1}" for i, spk in enumerate(order)}
+
+    lines: list[str] = []
+    for sent in sentences:
+        if not isinstance(sent, dict):
+            continue
+        # 官方两处 demo 键名不一致：sentence / text 都读
+        raw = sent.get("text") or sent.get("sentence") or ""
+        text = _strip_rich_tags(str(raw)).strip()
+        if not text:
+            continue
+        prefix = ""
+        if timestamps:
+            try:
+                start_ms = int(sent.get("start") or 0)
+            except (TypeError, ValueError):
+                start_ms = 0
+            if start_ms > 0:
+                prefix += f"[{_format_ms(start_ms)}] "
+        spk = sent.get("spk")
+        if spk is not None:
+            prefix += f"【{speaker_map.get(spk, spk)}】"
+        lines.append(f"{prefix}{text}" if prefix else text)
+    return "\n".join(lines)
+
+
 def prepare_local_audio(
     media_path: str,
     quality: str = "fast",
@@ -421,12 +586,15 @@ def transcribe_audio(
     engine_config 是「当前引擎专属」的配置块：
     - qwen_asr → config.transcribe.qwen_asr 块
     - xf_asr   → config.transcribe.xf_asr 块
+    - funasr   → transcribe 下所有 funasr_* 扁平键（说话人分离 / 缓存目录等）
     由调用方 (cli/processor) 按 asr_engine 装好对应块再传入，避免「给 xf_asr 传 qwen_asr 配置」导致凭证缺失误降 mock。
     """
     if asr_engine == "whisper":
         return transcribe_audio_with_whisper(audio_path, model_size, cpu_threads)
     if asr_engine == "funasr":
-        return transcribe_audio_with_funasr(audio_path, funasr_model)
+        return transcribe_audio_with_funasr(
+            audio_path, funasr_model, engine_config=engine_config
+        )
     if asr_engine == "qwen_asr":
         # 在 import qwen_asr / huggingface_hub 之前先设好 env 变量
         # （huggingface_hub 在 import 时把 ENDPOINT 缓存到 module-level 常量）
@@ -494,8 +662,29 @@ def transcribe_audio_with_whisper(audio_path: str, model_size: str = "tiny", cpu
     return full_text
 
 
-def transcribe_audio_with_funasr(audio_path: str, funasr_model: str = "sensevoice") -> str:
-    """Transcribe audio with FunASR."""
+def transcribe_audio_with_funasr(
+    audio_path: str,
+    funasr_model: str = "sensevoice",
+    engine_config: dict | None = None,
+) -> str:
+    """Transcribe audio with FunASR.
+
+    2026-10-02 新增：可选的**本地**说话人分离（SenseVoice + CAM++）。
+
+    engine_config 取 `transcribe` 下所有 `funasr_*` 键（由 processor._resolve_engine_config 装好）：
+      - funasr_speaker       (bool)  是否启用说话人分离，默认 False
+      - funasr_spk_model     (str)   说话人模型，默认 "cam++"
+      - funasr_timestamps    (bool)  分隔输出是否带 [MM:SS]，默认 True
+      - funasr_cache_dir     (str)   模型目录（_configured_funasr_dir 单独读，这里不用）
+
+    与 xf_asr 的区别（重要）：这是**本地**能力，不调网络、不花云端额度；
+    额外开销 = 多加载一个 ~28MB 的 CAM++ 嵌入模型 + 一次聚类，CPU 即可跑、不占显存。
+    """
+    cfg = engine_config or {}
+    want_speaker = bool(cfg.get("funasr_speaker", False))
+    spk_model_id = str(cfg.get("funasr_spk_model") or "cam++")
+    want_timestamps = bool(cfg.get("funasr_timestamps", True))
+
     # Prefer ASCII-safe cache (critical on Windows when project path has 中文)
     funasr_cache_dir = funasr_runtime_root()
     funasr_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -516,6 +705,7 @@ def transcribe_audio_with_funasr(audio_path: str, funasr_model: str = "sensevoic
 
     model_name, is_sensevoice = resolve_funasr_model_name(funasr_model)
     vad_model_name = resolve_funasr_vad_model_name()
+    spk_model_name = resolve_funasr_spk_model_name(spk_model_id) if want_speaker else ""
     start_time = time.time()
     logger.info(f"加载 FunASR 模型 ({model_name})...")
     logger.info(f"FunASR/ModelScope 模型缓存目录: {funasr_cache_dir}")
@@ -555,7 +745,7 @@ def transcribe_audio_with_funasr(audio_path: str, funasr_model: str = "sensevoic
         device="cpu",
     )
     if is_sensevoice:
-        model = funasr.AutoModel(
+        model_kwargs = dict(
             model=model_name,
             vad_model=vad_model_name,
             vad_kwargs={"max_single_segment_time": 30000},
@@ -563,13 +753,24 @@ def transcribe_audio_with_funasr(audio_path: str, funasr_model: str = "sensevoic
         )
         generate_kwargs = {"language": "zh", "use_itn": True, "batch_size_s": 60, "merge_vad": True}
     else:
-        model = funasr.AutoModel(
+        model_kwargs = dict(
             model=model_name,
             vad_model=vad_model_name,
             punc_model="ct-punc",
             **common_model_kwargs,
         )
         generate_kwargs = {"batch_size_s": 60}
+
+    # 2026-10-02：本地说话人分离（CAM++）
+    # FunASR 官方约束：spk_model 必须与 vad_model 一起传（聚类在 VAD 流水线里做）
+    if spk_model_name:
+        model_kwargs["spk_model"] = spk_model_name
+        logger.info(
+            f"已启用本地说话人分离（CAM++，模型={spk_model_name}）；"
+            "首次使用会从 ModelScope 下载约 28MB 到 FunASR 缓存目录"
+        )
+
+    model = funasr.AutoModel(**model_kwargs)
 
     logger.info(f"FunASR 模型加载完成 (耗时: {format_time(time.time() - load_start)})")
     logger.info("开始 FunASR 转写音频...")
@@ -585,6 +786,22 @@ def transcribe_audio_with_funasr(audio_path: str, funasr_model: str = "sensevoic
     except TypeError:
         # older funasr may not accept disable_pbar on generate
         result = model.generate(input=audio_path, **generate_kwargs)
+
+    # 2026-10-02：优先走说话人/时间戳格式；拿不到 sentence_info 就退回纯文本
+    if spk_model_name:
+        speaker_text = format_funasr_speaker_text(result, timestamps=want_timestamps)
+        if speaker_text:
+            text = traditional_to_simplified(speaker_text)
+            logger.info(
+                f"FunASR 说话人分离生效（{len(speaker_text.splitlines())} 段，"
+                f"{len(text)} 字符）"
+            )
+            logger.info(f"FunASR 转写总耗时: {format_time(time.time() - start_time)}")
+            return text
+        logger.warning(
+            "已挂载 CAM++ 但结果里没有 sentence_info——"
+            "可能 FunASR 版本较旧或音频只有单人语音，本次退回纯文本输出"
+        )
     text = extract_funasr_text(result)
     text = traditional_to_simplified(text.strip())
     logger.info(f"FunASR 转写完成 (耗时: {format_time(time.time() - transcribe_start)})")

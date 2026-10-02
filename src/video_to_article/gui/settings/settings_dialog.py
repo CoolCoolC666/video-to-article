@@ -36,6 +36,7 @@ from ...cover import (
     resolve_cover_pipeline_from_config,
 )
 from ...media.xf_asr import PD_DOMAINS
+from ...media.minimax_asr import MINIMAX_LANGUAGES
 
 
 def _scroll_page(inner: QWidget) -> QScrollArea:
@@ -157,6 +158,8 @@ class SettingsDialog(QDialog):
         self.tr_engine.addItem("qwen_asr", "qwen_asr")
         # 2026-09-27 新增：讯飞听见云端识别（xf_asr 引擎）
         self.tr_engine.addItem("xf_asr（讯飞听见）", "xf_asr")
+        # 2026-10-02 新增：MiniMax Speech-to-Text 云端识别（500 秒上限，会自动切段）
+        self.tr_engine.addItem("minimax_asr（MiniMax）", "minimax_asr")
         # 2026-09-27 防呆：切到 xf_asr 且凭证齐全时自动取消 Mock（避免"填了凭证但忘了取消勾选"陷阱）
         self.tr_engine.currentIndexChanged.connect(self._on_tr_engine_changed)
         self.tr_funasr = QLineEdit()
@@ -422,6 +425,79 @@ class SettingsDialog(QDialog):
         xf_enh_tip.setStyleSheet("color: #666; font-size: 11px;")
         outer.addWidget(xf_enh_tip)
 
+        # === 2026-10-02 新增：MiniMax Speech-to-Text ===
+        mm_box = QGroupBox("MiniMax 高级（minimax_asr 引擎专用）")
+        mmform = QFormLayout(mm_box)
+
+        self.mm_api_key = QLineEdit()
+        self.mm_api_key.setEchoMode(QLineEdit.Password)
+        self.mm_api_key.setPlaceholderText(
+            "控制台 → 账户管理 → 接口密钥（单件，不像讯飞要 APPID+SecretKey 两件）"
+        )
+
+        self.mm_language = QComboBox()
+        for code, label in MINIMAX_LANGUAGES.items():
+            self.mm_language.addItem(label, code)
+        self.mm_language.setToolTip(
+            "留空 = 自动检测主语言 + 中英混说（官方推荐，跨语言内容更稳）。\n"
+            "已知语言时显式指定，短音频 / 术语密集内容更稳。\n"
+            "注意：这是 HTTP **header** 不是 form 字段。\n"
+            "未授权的小语种会报错，本程序只暴露官方已支持列表。"
+        )
+
+        self.mm_mock = QCheckBox("Mock 模式（不调网络，返回 fake 文本，便于本地调试）")
+        self.mm_mock.setChecked(True)  # 默认开：没填 key 时不会真的调 API
+
+        self.mm_role_separation = QCheckBox("分离说话人（云端 diarization，标注【S1】…）")
+        self.mm_role_separation.setToolTip(
+            "开启后用 response_format=verbose_json，输出每段带【S1】/【S2】标签。\n"
+            "MiniMax 自带说话人分离，不需要额外模型（比本地 FunASR+CAM++ 省事）。\n"
+            "⚠ 超过 500 秒会自动切段，而**每段独立重编 S1/S2、响应里没有跨段身份信息**：\n"
+            "  人数相同时只能按编号对齐，两人音色接近时可能认错人。\n"
+            "  需要严格一致的跨段身份 → 用讯飞（5 小时单文件，不用切段）。\n"
+            "⚠ 短对话（<500 秒不切段）时分离最可靠，推荐优先用这类素材。\n"
+            "⚠ 开启说话人/时间戳会切到 verbose_json，耗时略增。"
+        )
+
+        self.mm_timestamps = QCheckBox("输出时间戳（每段加 [MM:SS] 前缀）")
+        self.mm_timestamps.setChecked(True)
+        self.mm_timestamps.setToolTip(
+            "开启后每段前面加 [MM:SS] 时间戳（读 segments[].start，单位是**秒**）。\n"
+            "与 xf_asr / funasr 的时间戳格式保持一致。\n"
+            "verbose_json 下同一说话人的相邻文本会被合并成句段。"
+        )
+
+        self.mm_max_wait = QSpinBox()
+        self.mm_max_wait.setRange(30, 7200)
+        self.mm_max_wait.setValue(300)
+        self.mm_max_wait.setToolTip(
+            "单次 HTTP 请求超时（秒）。MiniMax 是一次性返回（非流式），\n"
+            "按官方参考：500 秒音频约几秒到几十秒返回。切段后每段各用一次。"
+        )
+
+        mmform.addRow("API Key", self.mm_api_key)
+        mmform.addRow("语言", self.mm_language)
+        mmform.addRow(self.mm_mock)
+        mmform.addRow(self.mm_role_separation)
+        mmform.addRow(self.mm_timestamps)
+        mmform.addRow("单请求超时（秒）", self.mm_max_wait)
+        outer.addWidget(mm_box)
+
+        mm_tip = QLabel(
+            "💡 MiniMax Speech-to-Text（asr-1.0，云端 API）：\n"
+            "  · 鉴权：Authorization: Bearer <API Key>（单件，讯飞要两件套）\n"
+            "  · 真 multipart 上传（与讯飞相反：讯飞必须 query string + raw body）\n"
+            "  · **硬限制：单请求 ≤ 500 秒 / 50 MB**，超了直接报错不截断\n"
+            "    → 程序会自动切 450 秒一段并压成单声道 16kHz mp3（识别精度不受影响）\n"
+            "  · verbose_json 才返回 segments[] + n_speakers（说话人分离 + 时间戳）\n"
+            "  · 按音频时长计费；余额不足返回 402\n"
+            "  · 说话人分离在 <500 秒（不切段）时最可靠；长音频切段后跨段身份无法保证\n"
+            "  · Key 申请：https://platform.minimax.cn/user-center/basic-information/interface-key"
+        )
+        mm_tip.setWordWrap(True)
+        mm_tip.setStyleSheet("color: #666; font-size: 11px;")
+        outer.addWidget(mm_tip)
+
         # 2026-09-09: 中英混合等组合语言值的 API 限制说明（不暴露误导项）
         # qwen_asr 0.0.6 validate_language 只接受 30 种单语种；Chinese 跑混合足够
         mix_tip = QLabel(
@@ -465,30 +541,37 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(_scroll_page(page), "转写")
 
     def _on_tr_engine_changed(self, _index: int) -> None:
-        """2026-09-27 防呆：切到 xf_asr 引擎时自动同步 Mock 状态。
+        """2026-09-27 防呆：切到云端引擎时自动同步 Mock 状态。
 
         触发场景：
-        - 用户在「默认 ASR 引擎」下拉切到 xf_asr
-        - 若 APPID + SecretKey 都填了 + Mock 仍勾选 → 自动取消 Mock
+        - 用户在「默认 ASR 引擎」下拉切到 xf_asr / minimax_asr
+        - 若凭证都填了 + Mock 仍勾选 → 自动取消 Mock
           （因为凭证齐全还勾 mock = 实际走 mock 浪费 API 调用）
         - 若凭证缺失 → 保持 Mock 勾选（避免启动时悄悄调 API 失败）
-        - 切回其他引擎（funasr/whisper/qwen_asr）→ 不动 xf_asr GroupBox
+        - 切回其他引擎（funasr/whisper/qwen_asr）→ 不动云端引擎的 GroupBox
           （用户可能只是临时切走，回头还要切回来用）
         """
         engine = self.tr_engine.currentData()
-        if engine != "xf_asr":
-            return
-        has_creds = bool(
-            self.xf_app_id.text().strip() and self.xf_secret_key.text().strip()
-        )
-        if has_creds and self.xf_mock.isChecked():
-            self.xf_mock.setChecked(False)
-            QMessageBox.information(
-                self,
-                "讯飞听见 已自动取消 Mock",
-                "检测到 xf_asr 引擎 + 凭证齐全，自动取消 Mock 模式（避免误调 mock）。\n"
-                "如确实要本地调试，可重新勾选。",
+        if engine == "xf_asr":
+            has_creds = bool(
+                self.xf_app_id.text().strip() and self.xf_secret_key.text().strip()
             )
+            label = "讯飞听见"
+        elif engine == "minimax_asr":
+            has_creds = bool(self.mm_api_key.text().strip())
+            label = "MiniMax"
+        else:
+            return
+        if has_creds:
+            mock_box = self.xf_mock if engine == "xf_asr" else self.mm_mock
+            if mock_box.isChecked():
+                mock_box.setChecked(False)
+                QMessageBox.information(
+                    self,
+                    f"{label} 已自动取消 Mock",
+                    f"检测到 {engine} 引擎 + 凭证齐全，自动取消 Mock 模式（避免误调 mock）。\n"
+                    f"如确实要本地调试，可重新勾选。",
+                )
 
     def _on_xf_role_toggled(self, checked: bool) -> None:
         """2026-10-02：说话人分离开关 → 「发音人数」随之 enable/disable。
@@ -773,6 +856,20 @@ class SettingsDialog(QDialog):
         self.xf_colloquial_proc.setChecked(bool(xa.get("colloquial_proc", True)))
         self.xf_timestamps.setChecked(bool(xa.get("timestamps", True)))
 
+        # MiniMax Speech-to-Text（minimax_asr 引擎专用，2026-10-02 新增）
+        ma = (tr.get("minimax_asr") or {})
+        self.mm_api_key.setText(str(ma.get("api_key") or ""))
+        mlang = str(ma.get("language") or "")
+        midx = self.mm_language.findData(mlang)
+        self.mm_language.setCurrentIndex(midx if midx >= 0 else 0)
+        self.mm_mock.setChecked(bool(ma.get("mock", True)))
+        self.mm_role_separation.setChecked(bool(ma.get("role_separation", False)))
+        self.mm_timestamps.setChecked(bool(ma.get("timestamps", True)))
+        try:
+            self.mm_max_wait.setValue(int(ma.get("max_wait_seconds") or 300))
+        except (TypeError, ValueError):
+            self.mm_max_wait.setValue(300)
+
         yt = self._config.get("youtube") or {}
         browser = str(yt.get("cookies_from_browser") or "")
         idx = self.yt_browser.findData(browser)
@@ -883,6 +980,14 @@ class SettingsDialog(QDialog):
                     "pd_domain": self.xf_pd_domain.currentData() or "",
                     "colloquial_proc": self.xf_colloquial_proc.isChecked(),
                     "timestamps": self.xf_timestamps.isChecked(),
+                },
+                "minimax_asr": {
+                    "api_key": self.mm_api_key.text().strip(),
+                    "language": self.mm_language.currentData() or "",
+                    "mock": self.mm_mock.isChecked(),
+                    "role_separation": self.mm_role_separation.isChecked(),
+                    "timestamps": self.mm_timestamps.isChecked(),
+                    "max_wait_seconds": self.mm_max_wait.value(),
                 },
             },
             "youtube": {

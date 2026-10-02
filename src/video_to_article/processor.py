@@ -140,6 +140,7 @@ def _resolve_engine_config(config: dict | None, asr_engine: str) -> dict | None:
     现在按 asr_engine 装对应块：
       - qwen_asr → transcribe.qwen_asr 块
       - xf_asr   → transcribe.xf_asr 块
+      - minimax_asr → transcribe.minimax_asr 块
       - funasr   → transcribe 下所有 funasr_* 扁平键（2026-10-02：说话人分离等）
       - 其它     → None（whisper 无需引擎专属配置）
 
@@ -152,6 +153,8 @@ def _resolve_engine_config(config: dict | None, asr_engine: str) -> dict | None:
         return tr.get("qwen_asr", {})
     if asr_engine == "xf_asr":
         return tr.get("xf_asr", {})
+    if asr_engine == "minimax_asr":
+        return tr.get("minimax_asr", {})
     if asr_engine == "funasr":
         # funasr 的配置是扁平的（funasr_cache_dir / funasr_speaker / ...），
         # 统一收进一个 dict 走 engine_config 通道，避免再加一个位置参数。
@@ -542,6 +545,10 @@ def process_video(
             print(f"   ASR 引擎: Qwen3-ASR (来自 qwen_asr 包)")
         elif asr_engine == "xf_asr":
             print("   ASR 引擎: 讯飞听见 (xf_asr，云端 API)")
+        elif asr_engine == "minimax_asr":
+            _mm = (config or {}).get("transcribe", {}).get("minimax_asr") or {}
+            _spk = "  + 说话人分离" if _mm.get("role_separation") else ""
+            print(f"   ASR 引擎: MiniMax STT (minimax_asr，云端 API{_spk})")
         else:
             print(f"   ASR 引擎: Whisper ({model_size})")
         try:

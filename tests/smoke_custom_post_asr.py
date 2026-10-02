@@ -11,7 +11,7 @@ Covers:
   8. processor._resolve_engine_config / audio dispatch / SettingsDialog 读写真实注册
 
 不调网络、不消耗额度 —— 全部是 mock session + 纯函数断言。
-从仓库根运行：python tests\\smoke_minimax_asr.py
+从仓库根运行：python tests\\smoke_custom_post_asr.py
 """
 from __future__ import annotations
 
@@ -25,29 +25,31 @@ sys.path.insert(0, r"src")
 
 def test_spec_constants():
     """1. 常量必须跟 OpenAPI spec 完全一致 —— 写错就是 400/413。"""
-    import video_to_article.media.minimax_asr as mm
+    import video_to_article.media.custom_post_asr as cp
 
-    assert mm._STT_URL == "https://api.minimax.cn/v1/speech_to_text", (
-        f"端点错: {mm._STT_URL}"
+    assert cp.DEFAULT_ENDPOINT == "https://api.minimax.cn/v1/speech_to_text", (
+        f"默认端点错: {cp.DEFAULT_ENDPOINT}"
     )
-    assert mm._MODEL == "asr-1.0", f"模型必须是 asr-1.0，实得 {mm._MODEL}"
+    # 端点必须是可配的（用户自定义），不能硬编码在调用处
+    assert isinstance(cp.DEFAULT_ENDPOINT, str) and cp.DEFAULT_ENDPOINT.startswith("https://")
+    assert cp._MODEL == "asr-1.0", f"模型必须是 asr-1.0，实得 {cp._MODEL}"
     # spec: 时长 ≤ 500 秒（超了 400），大小 ≤ 50MB（超了 413）
-    assert mm.MAX_DURATION_SEC == 500, f"时长上限错: {mm.MAX_DURATION_SEC}"
-    assert mm.MAX_FILE_BYTES == 50 * 1024 * 1024, (
-        f"体积上限错: {mm.MAX_FILE_BYTES}"
+    assert cp.MAX_DURATION_SEC == 500, f"时长上限错: {cp.MAX_DURATION_SEC}"
+    assert cp.MAX_FILE_BYTES == 50 * 1024 * 1024, (
+        f"体积上限错: {cp.MAX_FILE_BYTES}"
     )
     # 切段必须留余量，不能卡着 500s
-    assert mm.CHUNK_SEGMENT_SEC < mm.MAX_DURATION_SEC, (
+    assert cp.CHUNK_SEGMENT_SEC < cp.MAX_DURATION_SEC, (
         "切段秒数必须小于上限，否则探测误差就会 400"
     )
     # 官方支持格式（裸 PCM 明确不支持）
     for ext in (".mp3", ".wav", ".m4a", ".flac", ".opus", ".ogg"):
-        assert ext in mm.SUPPORTED_EXTS, f"应支持 {ext}"
-    assert ".pcm" not in mm.SUPPORTED_EXTS, "裸 PCM 官方明确不支持"
+        assert ext in cp.SUPPORTED_EXTS, f"应支持 {ext}"
+    assert ".pcm" not in cp.SUPPORTED_EXTS, "裸 PCM 官方明确不支持"
     # 语言列表第一个必须是空串（自动检测）
-    assert "" in mm.MINIMAX_LANGUAGES, "应支持留空 = 自动检测"
+    assert "" in cp.MINIMAX_LANGUAGES, "应支持留空 = 自动检测"
     for code in ("zh", "yue", "en", "ja", "ko"):
-        assert code in mm.MINIMAX_LANGUAGES, f"应支持语言 {code}"
+        assert code in cp.MINIMAX_LANGUAGES, f"应支持语言 {code}"
     print("OK 1: OpenAPI spec 常量一致（500s / 50MB / asr-1.0 / 端点 / 语言表）\n")
 
 
@@ -57,7 +59,7 @@ def test_upload_contract():
     这里最容易踩的坑是**照抄讯飞那套**（query string + raw body）。
     MiniMax 官方 curl 明确是 multipart/form-data，跟讯飞正好相反。
     """
-    import video_to_article.media.minimax_asr as mm
+    import video_to_article.media.custom_post_asr as cp
     import tempfile
 
     audio = os.path.join(tempfile.gettempdir(), "minimax_smoke.wav")
@@ -88,13 +90,13 @@ def test_upload_contract():
         def close(self):
             pass
 
-    mm._cached_session = FakeSession()
+    cp._cached_session = FakeSession()
     try:
-        result = mm._transcribe_one(
-            mm.Path(audio), "test-key-123", "zh", False, False, 300
+        result = cp._transcribe_one(
+            cp.Path(audio), "test-key-123", "zh", False, False, 300
         )
     finally:
-        mm._release_cached_session()
+        cp._release_cached_session()
         os.unlink(audio)
 
     assert result["text"] == "识别成功", f"应返回解析后的 JSON，实得 {result}"
@@ -138,12 +140,12 @@ def test_upload_contract():
             })
             return FakeResp()
 
-    mm._cached_session = FakeSession2()
+    cp._cached_session = FakeSession2()
     try:
         # language 留空 → 不应出现 language header（= 自动检测）
-        mm._transcribe_one(mm.Path(audio2), "k", "", True, True, 300)
+        cp._transcribe_one(cp.Path(audio2), "k", "", True, True, 300)
     finally:
-        mm._release_cached_session()
+        cp._release_cached_session()
         os.unlink(audio2)
 
     assert "language" not in captured2["headers"], (
@@ -166,7 +168,7 @@ def test_split_threshold():
 
     这是本引擎与 xf_asr 最本质的区别：都是云端，但 MiniMax 上限差两个数量级。
     """
-    import video_to_article.media.minimax_asr as mm
+    import video_to_article.media.custom_post_asr as cp
     import tempfile
 
     # 造一个小文件（体积远小于 50MB），用 max_duration 参数控制时长判断
@@ -176,41 +178,41 @@ def test_split_threshold():
 
     # 不切段：传一个明确在上限内的 max_duration
     try:
-        paths, is_chunked = mm._split_audio_for_long(audio, 300.0)
+        paths, is_chunked = cp._split_audio_for_long(audio, 300.0)
         assert is_chunked is False, f"300s 不该切，实得 is_chunked={is_chunked}"
         assert len(paths) == 1, f"应返回单文件，实得 {len(paths)} 段"
     finally:
         os.unlink(audio)
 
     # 超时长：mock 掉 _do_split，返回两个假段路径
-    fake = [mm.Path("chunk_000000.mp3"), mm.Path("chunk_000450.mp3")]
-    orig_do_split = mm._do_split
-    orig_probe = mm._probe_audio_duration
-    mm._do_split = lambda p, seg: fake
-    mm._probe_audio_duration = lambda p: 1500.0
+    fake = [cp.Path("chunk_000000.mp3"), cp.Path("chunk_000450.mp3")]
+    orig_do_split = cp._do_split
+    orig_probe = cp._probe_audio_duration
+    cp._do_split = lambda p, seg: fake
+    cp._probe_audio_duration = lambda p: 1500.0
     audio2 = os.path.join(tempfile.gettempdir(), "minimax_split2.wav")
     with open(audio2, "wb") as f:
         f.write(b"RIFF" + b"\0" * 4096)
     try:
-        paths2, is_chunked2 = mm._split_audio_for_long(audio2, -1.0)
+        paths2, is_chunked2 = cp._split_audio_for_long(audio2, -1.0)
         assert is_chunked2 is True, "1500s 超上限，必须切段"
         assert len(paths2) == 2, f"应切 2 段（1500/450=4 段由 ffmpeg 实际决定，mock 返回 2）"
-        assert mm._split_audio_for_long.__doc__ or True
+        assert cp._split_audio_for_long.__doc__ or True
     finally:
-        mm._do_split = orig_do_split
-        mm._probe_audio_duration = orig_probe
+        cp._do_split = orig_do_split
+        cp._probe_audio_duration = orig_probe
         os.unlink(audio2)
 
     # 切段失败必须抛明确错误，而不是静默直传（否则服务端 400）
-    mm._do_split = lambda p, seg: []
-    mm._probe_audio_duration = lambda p: 1500.0
+    cp._do_split = lambda p, seg: []
+    cp._probe_audio_duration = lambda p: 1500.0
     audio3 = os.path.join(tempfile.gettempdir(), "minimax_split3.wav")
     with open(audio3, "wb") as f:
         f.write(b"RIFF" + b"\0" * 4096)
     try:
         raised = False
         try:
-            mm._split_audio_for_long(audio3, -1.0)
+            cp._split_audio_for_long(audio3, -1.0)
         except RuntimeError as e:
             raised = True
             assert "ffmpeg" in str(e).lower() or "切段" in str(e), (
@@ -218,8 +220,8 @@ def test_split_threshold():
             )
         assert raised, "切段失败时必须抛错，不能静默直传（服务端会 400）"
     finally:
-        mm._do_split = orig_do_split
-        mm._probe_audio_duration = orig_probe
+        cp._do_split = orig_do_split
+        cp._probe_audio_duration = orig_probe
         os.unlink(audio3)
 
     print("OK 3: 切段阈值对（≤500s 直传 / 超时切段 / 切段失败抛错）\n")
@@ -227,7 +229,7 @@ def test_split_threshold():
 
 def test_verbose_json_parse():
     """4. verbose_json → 【S1】+ [MM:SS]；两个开关关掉走 text 兜底。"""
-    import video_to_article.media.minimax_asr as mm
+    import video_to_article.media.custom_post_asr as cp
 
     # 用 OpenAPI spec 里的官方示例数据
     verbose = {
@@ -243,21 +245,21 @@ def test_verbose_json_parse():
         "trace_id": "021785229015510a2c883cf675b9804d",
     }
 
-    both = mm._assemble([verbose], True, True, [12.744])
+    both = cp._assemble([verbose], True, True, [12.744])
     lines = both.split("\n")
     assert len(lines) == 2, f"应 2 行，实得 {lines}"
     assert lines[0] == "[00:00] 【S1】嘎嘎会，可以，这把稳了。", f"第 1 行错: {lines[0]!r}"
     assert lines[1] == "[00:02] 【S2】来检查一下，读下题。", f"第 2 行错: {lines[1]!r}"
     print(f"OK 4a: verbose_json 解析 →\n{both}")
 
-    only_spk = mm._assemble([verbose], True, False, [12.744])
+    only_spk = cp._assemble([verbose], True, False, [12.744])
     assert only_spk == "【S1】嘎嘎会，可以，这把稳了。\n【S2】来检查一下，读下题。", (
         f"只开分离实得 {only_spk!r}"
     )
 
     # 两个开关都关 + json 格式响应（无 segments）→ 整段返回 text
     plain = {"text": "一整段文字", "duration": 12.0, "trace_id": "t"}
-    assert mm._assemble([plain], False, False, [12.0]) == "一整段文字", (
+    assert cp._assemble([plain], False, False, [12.0]) == "一整段文字", (
         "json 格式（无 segments）应整段返回 text"
     )
     print("OK 4b: 开关组合 + json 格式 text 兜底 ✓\n")
@@ -270,7 +272,7 @@ def test_cross_chunk():
     所以段间人数相同时只能按编号对齐（本测试验证的正是这个行为），
     人数变多时才分配新的全局编号。
     """
-    import video_to_article.media.minimax_asr as mm
+    import video_to_article.media.custom_post_asr as cp
 
     # 段 1：450s，两人
     c1 = {
@@ -288,7 +290,7 @@ def test_cross_chunk():
             {"id": 1, "start": 6.0, "end": 9.0, "speaker": "S2", "text": "好我记一下"},
         ],
     }
-    merged = mm._assemble([c1, c2], True, True, [450.0, 120.0])
+    merged = cp._assemble([c1, c2], True, True, [450.0, 120.0])
     lines = merged.split("\n")
     assert len(lines) == 4, f"应 4 行，实得 {len(lines)}"
     # 时间戳必须累加段偏移：段 2 的 1.0s → 全局 451s → 07:31
@@ -310,7 +312,7 @@ def test_cross_chunk():
             {"id": 2, "start": 5.0, "end": 6.0, "speaker": "S3", "text": "C说"},
         ],
     }
-    merged3 = mm._assemble([c1, c3], True, False, [450.0, 30.0])
+    merged3 = cp._assemble([c1, c3], True, False, [450.0, 30.0])
     assert "【S3】C说" in merged3, (
         f"新出现的第三个人应分配 S3，实得:\n{merged3}"
     )
@@ -324,7 +326,7 @@ def test_error_hints():
     spec 的错误体是 {"type":"error","error":{...,"http_code":"400"},"request_id":...}，
     且 HTTP 状态码就是真实错误码。余额不足（402）和体积超（413）最容易遇到。
     """
-    import video_to_article.media.minimax_asr as mm
+    import video_to_article.media.custom_post_asr as cp
 
     def _resp(status, body):
         class R:
@@ -356,7 +358,7 @@ def test_error_hints():
             },
             "request_id": "req-xyz",
         }
-        hint = mm._extract_error(_resp(status, body))
+        hint = cp._extract_error(_resp(status, body))
         assert f"HTTP {status}" in hint, f"{status} 应带状态码: {hint}"
         assert keyword in hint, f"{status} 的提示应含「{keyword}」: {hint}"
         assert "req-xyz" in hint, f"{status} 应带 request_id 便于排查: {hint}"
@@ -365,7 +367,7 @@ def test_error_hints():
 
 def test_mock_branches():
     """7. Mock 三分支（与 xf_asr 行为一致，便于用户形成统一心智）。"""
-    import video_to_article.media.minimax_asr as mm
+    import video_to_article.media.custom_post_asr as cp
     import tempfile
 
     audio = os.path.join(tempfile.gettempdir(), "minimax_mock.wav")
@@ -373,9 +375,9 @@ def test_mock_branches():
         f.write(b"RIFF" + b"\0" * 2048)
     try:
         # 情况 2/3：显式 mock 或凭证缺失 → 返回 fake 文本，不调网络
-        t1 = mm.transcribe_audio_with_minimax_asr(audio, {"mock": True})
+        t1 = cp.transcribe_audio_with_custom_post(audio, {"mock": True})
         assert t1 and "mock" in t1.lower(), f"mock 文本异常: {t1!r}"
-        t2 = mm.transcribe_audio_with_minimax_asr(audio, {"mock": False})  # 凭证缺失
+        t2 = cp.transcribe_audio_with_custom_post(audio, {"mock": False})  # 凭证缺失
         assert t2 and "mock" in t2.lower(), f"凭证缺失应降级 mock，实得 {t2!r}"
         print("OK 7a: mock=true / 凭证缺失 → 都返回 fake 文本不调网络")
     finally:
@@ -383,7 +385,7 @@ def test_mock_branches():
 
     # 凭证齐全 + mock 未勾 + 缺文件 → 应该在切段/上传前就抛明确错误
     try:
-        mm.transcribe_audio_with_minimax_asr(
+        cp.transcribe_audio_with_custom_post(
             "N:/definitely/not/exist.wav",
             {"mock": False, "api_key": "k"},
         )
@@ -401,12 +403,12 @@ def test_registration():
 
     cfg = {
         "transcribe": {
-            "minimax_asr": {"api_key": "mm-key", "role_separation": True},
+            "custom_post": {"api_key": "mm-key", "role_separation": True},
             "xf_asr": {"app_id": "xf", "secret_key": "s"},
             "funasr_speaker": True,
         }
     }
-    got = _resolve_engine_config(cfg, "minimax_asr")
+    got = _resolve_engine_config(cfg, "custom_post")
     assert got == {"api_key": "mm-key", "role_separation": True}, (
         f"minimax 配置块取错: {got}"
     )
@@ -418,19 +420,46 @@ def test_registration():
     )
     print("OK 8a: _resolve_engine_config 三个引擎互不污染 ✓")
 
-    # audio dispatch 认得 minimax_asr
+    # audio dispatch 认得 custom_post（新名 + 旧名别名）
     from video_to_article.media import audio as A
 
     assert hasattr(A, "transcribe_audio"), "缺 transcribe_audio 入口"
     src = open(A.__file__, encoding="utf-8").read()
-    assert 'asr_engine == "minimax_asr"' in src, "audio.py 未注册 minimax_asr 分支"
-    print("OK 8b: audio.py dispatch 已注册 minimax_asr ✓")
+    assert '"custom_post", "minimax_asr"' in src, (
+        "audio.py 的 dispatch 应同时接受 custom_post 与旧名 minimax_asr"
+    )
+    assert "transcribe_audio_with_custom_post" in src, (
+        "audio.py 应转发到 transcribe_audio_with_custom_post"
+    )
+    print("OK 8b: audio.py dispatch 已注册 custom_post + 旧名别名 ✓")
 
-    # CLI choices
+    # 旧引擎名兼容：minimax_asr 仍能跑（转发 + WARNING）
+    import video_to_article.media.custom_post_asr as cp
+
+    assert hasattr(cp, "transcribe_audio_with_minimax_asr"), (
+        "应保留 transcribe_audio_with_minimax_asr 旧入口，否则用户已保存的 config 会静默失效"
+    )
+    # 旧名优先读新块；没有新块才回落旧块
+    both = {
+        "transcribe": {
+            "custom_post": {"api_key": "new"},
+            "minimax_asr": {"api_key": "old"},
+        }
+    }
+    assert _resolve_engine_config(both, "minimax_asr") == {"api_key": "new"}, (
+        "旧名应优先读新块"
+    )
+    only_old = {"transcribe": {"minimax_asr": {"api_key": "old"}}}
+    assert _resolve_engine_config(only_old, "minimax_asr") == {"api_key": "old"}, (
+        "只有旧块时应能回落（旧名用户不能丢配置）"
+    )
+    print("OK 8b2: 旧名 minimax_asr 兼容（新块优先 / 回落旧块）✓")
+
+    # CLI choices：只列新名（旧名走 config 仍兼容，不占 choices 位置）
     from video_to_article.cli import build_parser
 
-    args = build_parser().parse_args(["--asr-engine", "minimax_asr"])
-    assert args.asr_engine == "minimax_asr", "CLI 未接受 --asr-engine minimax_asr"
+    args = build_parser().parse_args(["--asr-engine", "custom_post"])
+    assert args.asr_engine == "custom_post", "CLI 未接受 --asr-engine custom_post"
     # 非法引擎仍应被 choices 挡住（别把拼错的引擎名放进来）
     try:
         build_parser().parse_args(["--asr-engine", "minimax"])
@@ -438,7 +467,7 @@ def test_registration():
     except SystemExit:
         raised = True
     assert raised, "拼错的引擎名应被 choices 拒绝"
-    print("OK 8c: CLI --asr-engine minimax_asr 可用 + 非法值被拒 ✓")
+    print("OK 8c: CLI --asr-engine custom_post 可用 + 非法值被拒 ✓")
 
     # GUI 字段
     from PySide6.QtWidgets import QApplication
@@ -449,9 +478,11 @@ def test_registration():
     app = QApplication.instance() or QApplication([])
     sample = {
         "transcribe": {
-            "asr_engine": "minimax_asr",
-            "minimax_asr": {
-                "api_key": "mm-test-key",
+            "asr_engine": "custom_post",
+            "custom_post": {
+                "endpoint": "https://my-asr.internal/v1/stt",
+                "api_key": "test-key",
+                "headers_file": "D:/tmp/h.txt",
                 "language": "zh",
                 "mock": False,
                 "role_separation": True,
@@ -464,23 +495,164 @@ def test_registration():
     sd_mod.load_config = lambda: sample
 
     d = SettingsDialog()
-    assert d.mm_api_key.text() == "mm-test-key", "API Key 读错"
-    assert d.mm_language.currentData() == "zh", "语言读错"
-    assert d.mm_mock.isChecked() is False, "mock 读错"
-    assert d.mm_role_separation.isChecked() is True, "说话人分离读错"
-    assert d.mm_timestamps.isChecked() is True, "时间戳读错"
-    assert d.mm_max_wait.value() == 900, "超时读错"
+    assert d.cp_endpoint.text() == "https://my-asr.internal/v1/stt", "端点读错"
+    assert d.cp_api_key.text() == "test-key", "API Key 读错"
+    assert d.cp_headers_file.text() == "D:/tmp/h.txt", "请求头文件路径读错"
+    assert d.cp_language.currentData() == "zh", "语言读错"
+    assert d.cp_mock.isChecked() is False, "mock 读错"
+    assert d.cp_role_separation.isChecked() is True, "说话人分离读错"
+    assert d.cp_timestamps.isChecked() is True, "时间戳读错"
+    assert d.cp_max_wait.value() == 900, "超时读错"
 
-    d.mm_language.setCurrentIndex(d.mm_language.findData(""))
-    d.mm_role_separation.setChecked(False)
+    d.cp_endpoint.setText("https://another.internal/v1/stt")
+    d.cp_headers_file.setText("")
+    d.cp_language.setCurrentIndex(d.cp_language.findData(""))
+    d.cp_role_separation.setChecked(False)
     tr = d._collect_updates()["transcribe"]
-    assert tr["minimax_asr"]["language"] == "", f"语言写错: {tr}"
-    assert tr["minimax_asr"]["role_separation"] is False, f"说话人写错: {tr}"
-    assert tr["minimax_asr"]["api_key"] == "mm-test-key", f"Key 写错: {tr}"
-    assert tr["minimax_asr"]["max_wait_seconds"] == 900, f"超时写错: {tr}"
+    cpw = tr["custom_post"]
+    assert cpw["endpoint"] == "https://another.internal/v1/stt", f"端点写错: {cpw}"
+    assert cpw["headers_file"] == "", f"请求头文件写错: {cpw}"
+    assert cpw["language"] == "", f"语言写错: {cpw}"
+    assert cpw["role_separation"] is False, f"说话人写错: {cpw}"
+    assert cpw["api_key"] == "test-key", f"Key 写错: {cpw}"
+    assert cpw["max_wait_seconds"] == 900, f"超时写错: {cpw}"
     # 其它引擎块没被覆盖
     assert "xf_asr" in tr and "qwen_asr" in tr, "其它引擎配置块丢了"
-    print("OK 8d: SettingsDialog MiniMax 字段读/写/隔离都对\n")
+    assert "minimax_asr" not in tr, "旧块不该再被 GUI 写出（已改名）"
+    print("OK 8d: SettingsDialog custom_post 字段读/写/隔离都对\n")
+
+
+def test_endpoint_and_headers():
+    """9. 端点可配 + 请求头文件（这是本次泛化的核心）。"""
+    import os
+    import tempfile
+
+    import video_to_article.media.custom_post_asr as cp
+
+    # === 9a: 请求头文件解析 ===
+    hpath = os.path.join(tempfile.gettempdir(), "smoke_headers.txt")
+    with open(hpath, "w", encoding="utf-8") as f:
+        f.write(
+            "# 这是注释\n"
+            "\n"
+            "X-Deploy-Token: secret-token-value   # 行内注释\n"
+            "X-Gateway-Route: asr-prod\n"
+            "Authorization: Token from-file\n"
+            "  # 缩进注释也应忽略\n"
+            "BadLineWithoutColon\n"
+            "X-Empty:\n"
+        )
+    try:
+        got = cp.load_headers_file(cp.Path(hpath))
+        # 注释/空行/缩进注释都跳掉
+        assert got.get("X-Deploy-Token") == "secret-token-value", (
+            f"行内注释应被剥掉: {got!r}"
+        )
+        assert got.get("X-Gateway-Route") == "asr-prod", f"普通头解析错: {got!r}"
+        assert got.get("Authorization") == "Token from-file", (
+            f"请求头文件里的 Authorization 应生效: {got!r}"
+        )
+        # 空值 = 用户想显式置空
+        assert got.get("X-Empty") == "", f"空值应保留为空串: {got!r}"
+        # 没有冒号的行不崩、不进结果
+        assert "BadLineWithoutColon" not in got, f"非法行不该进结果: {got!r}"
+        print(f"OK 9a: 请求头文件解析（注释/行内注释/空值/非法行）→ {sorted(got)}")
+
+        # === 9b: 凭证可以只来自请求头文件（API Key 留空）===
+        headers = cp.build_headers("", "zh", got)
+        assert headers.get("Authorization") == "Token from-file", (
+            f"空 API Key 时应用文件里的 Authorization: {headers!r}"
+        )
+        # Bearer 模式：API Key 优先，文件可覆盖
+        b1 = cp.build_headers("KEY", "zh", got)
+        assert b1["Authorization"] == "Token from-file", (
+            f"请求头文件应覆盖程序生成的 Authorization: {b1!r}"
+        )
+        # 不带文件时才是 Bearer
+        b2 = cp.build_headers("KEY", "zh", {})
+        assert b2["Authorization"] == "Bearer KEY", f"默认该是 Bearer: {b2!r}"
+        # 空值 = 删掉 language
+        b3 = cp.build_headers("KEY", "zh", {"language": ""})
+        assert "language" not in b3, f"空值应删掉该头: {b3!r}"
+        print("OK 9b: 凭证双来源（API Key / 文件 Authorization）优先级对")
+
+        # === 9c: 端点可配：_transcribe_one 真的用传进来的 endpoint ===
+        audio = os.path.join(tempfile.gettempdir(), "smoke_ep.wav")
+        with open(audio, "wb") as f:
+            f.write(b"RIFF" + b"\0" * 2048)
+        seen = {}
+
+        class R:
+            status_code = 200
+
+            def json(self):
+                return {"text": "ok", "duration": 1.0}
+
+        class S:
+            def post(self, url, headers=None, data=None, files=None, timeout=None, **kw):
+                seen["url"] = url
+                seen["headers"] = headers or {}
+                return R()
+
+            def close(self):
+                pass
+
+        cp._cached_session = S()
+        custom_url = "https://my-asr.internal/v1/stt"
+        try:
+            cp._transcribe_one(
+                cp.Path(audio), "KEY", "", False, False, 60,
+                endpoint=custom_url, extra_headers=got,
+            )
+        finally:
+            cp._release_cached_session()
+            os.unlink(audio)
+        assert seen["url"] == custom_url, (
+            f"应打自定义端点，实得 {seen['url']!r}（说明 endpoint 没生效）"
+        )
+        assert seen["headers"].get("X-Deploy-Token") == "secret-token-value", (
+            f"自定义请求头应真的发出去: {seen['headers']!r}"
+        )
+        assert seen["headers"].get("Authorization") == "Token from-file", (
+            f"文件里的 Authorization 应覆盖 Bearer: {seen['headers']!r}"
+        )
+        # 敏感值绝不能进日志（这里只验证代码里没把它格式化进 msg——靠 review）
+        assert "secret-token-value" not in repr(sorted(seen["headers"])), "键名列表不该含值"
+        print("OK 9c: 端点可配 + 自定义请求头真的发出去")
+
+        # === 9d: 端点格式预检：非 http 开头要早报错 ===
+        try:
+            cp.transcribe_audio_with_custom_post(
+                audio, {"api_key": "K", "mock": False, "endpoint": "ftp://bad"}
+            )
+            raised = False
+        except RuntimeError as e:
+            raised = True
+            assert "http" in str(e).lower(), f"应提示 http/https: {e}"
+        assert raised, "非 http 端点应提前抛错，不该白发一次请求"
+        print("OK 9d: 端点格式预检（非 http(s) 早报错）")
+
+        # === 9e: 模板生成 + 幂等（不覆盖已有文件）===
+        tpath = os.path.join(tempfile.gettempdir(), "smoke_tpl_headers.txt")
+        if os.path.exists(tpath):
+            os.unlink(tpath)
+        p1 = cp.write_headers_template(cp.Path(tpath))
+        assert p1.exists(), "模板应被创建"
+        first = p1.read_text(encoding="utf-8")
+        assert "Key: Value" in first, "模板应说明格式"
+        assert "Authorization" in first, "模板应提到 Authorization 用法"
+        # 再生成一次不应覆盖用户内容
+        p1.write_text("X-My-Own: keep-me", encoding="utf-8")
+        cp.write_headers_template(cp.Path(tpath), overwrite=False)
+        assert p1.read_text(encoding="utf-8") == "X-My-Own: keep-me", (
+            "已存在的请求头文件不该被模板覆盖（会冲掉用户手写内容）"
+        )
+        os.unlink(tpath)
+        print("OK 9e: 模板生成 + 不覆盖已有文件")
+    finally:
+        if os.path.exists(hpath):
+            os.unlink(hpath)
+    print("OK 9: 端点可配 + 请求头文件全链路对\n")
 
 
 def main():
@@ -492,8 +664,9 @@ def main():
     test_error_hints()
     test_mock_branches()
     test_registration()
+    test_endpoint_and_headers()
     print("=" * 50)
-    print("ALL minimax_asr smoke tests passed ✓")
+    print("ALL custom_post smoke tests passed ✓")
     print("=" * 50)
 
 

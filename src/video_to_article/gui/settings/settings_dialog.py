@@ -36,7 +36,13 @@ from ...cover import (
     resolve_cover_pipeline_from_config,
 )
 from ...media.xf_asr import PD_DOMAINS
-from ...media.minimax_asr import MINIMAX_LANGUAGES
+from ...media.custom_post_asr import (
+    DEFAULT_ENDPOINT,
+    HEADERS_FILENAME,
+    MINIMAX_LANGUAGES,
+    default_headers_file,
+    write_headers_template,
+)
 
 
 def _scroll_page(inner: QWidget) -> QScrollArea:
@@ -158,8 +164,8 @@ class SettingsDialog(QDialog):
         self.tr_engine.addItem("qwen_asr", "qwen_asr")
         # 2026-09-27 新增：讯飞听见云端识别（xf_asr 引擎）
         self.tr_engine.addItem("xf_asr（讯飞听见）", "xf_asr")
-        # 2026-10-02 新增：MiniMax Speech-to-Text 云端识别（500 秒上限，会自动切段）
-        self.tr_engine.addItem("minimax_asr（MiniMax）", "minimax_asr")
+        # 2026-10-02 新增：自定义 POST 云端识别（端点+请求头均可配）
+        self.tr_engine.addItem("custom_post（自定义 POST）", "custom_post")
         # 2026-09-27 防呆：切到 xf_asr 且凭证齐全时自动取消 Mock（避免"填了凭证但忘了取消勾选"陷阱）
         self.tr_engine.currentIndexChanged.connect(self._on_tr_engine_changed)
         self.tr_funasr = QLineEdit()
@@ -425,74 +431,106 @@ class SettingsDialog(QDialog):
         xf_enh_tip.setStyleSheet("color: #666; font-size: 11px;")
         outer.addWidget(xf_enh_tip)
 
-        # === 2026-10-02 新增：MiniMax Speech-to-Text ===
-        mm_box = QGroupBox("MiniMax 高级（minimax_asr 引擎专用）")
+        # === 2026-10-02 新增：自定义 POST（端点 + 请求头都可配）===
+        mm_box = QGroupBox("自定义（POST）高级 — custom_post 引擎专用")
         mmform = QFormLayout(mm_box)
 
-        self.mm_api_key = QLineEdit()
-        self.mm_api_key.setEchoMode(QLineEdit.Password)
-        self.mm_api_key.setPlaceholderText(
-            "控制台 → 账户管理 → 接口密钥（单件，不像讯飞要 APPID+SecretKey 两件）"
+        self.cp_endpoint = QLineEdit()
+        self.cp_endpoint.setPlaceholderText(DEFAULT_ENDPOINT)
+        self.cp_endpoint.setToolTip(
+            "接口地址（POST）。默认是 MiniMax 官方的 Speech-to-Text：\n"
+            f"{DEFAULT_ENDPOINT}\n\n"
+            "可改成任意兼容这套请求-响应契约的服务：\n"
+            "  · 私有部署 / 自建网关\n"
+            "  · 其他云厂商的兼容接口\n"
+            "  · 本地转写服务（配合请求头文件里的鉴权）\n\n"
+            "必须以 http:// 或 https:// 开头。\n"
+            "程序发起的是 multipart/form-data：model / file / response_format /\n"
+            "timestamp_level / stream 五个字段 + language 请求头。"
         )
 
-        self.mm_language = QComboBox()
+        self.cp_api_key = QLineEdit()
+        self.cp_api_key.setEchoMode(QLineEdit.Password)
+        self.cp_api_key.setPlaceholderText(
+            "写入 Authorization: Bearer <key>（非 Bearer 鉴权请留空，改用请求头文件）"
+        )
+
+        self.cp_headers_file = QLineEdit()
+        self.cp_headers_file.setPlaceholderText(
+            f"留空 = 用程序内 {HEADERS_FILENAME}"
+        )
+        self.cp_headers_btn = QPushButton("浏览…")
+        self.cp_headers_btn.clicked.connect(self._pick_custom_headers_file)
+        self.cp_headers_tpl_btn = QPushButton("生成模板")
+        self.cp_headers_tpl_btn.clicked.connect(self._make_custom_headers_template)
+        self.cp_headers_row = QWidget()
+        _hrow = QHBoxLayout(self.cp_headers_row)
+        _hrow.setContentsMargins(0, 0, 0, 0)
+        _hrow.addWidget(self.cp_headers_file)
+        _hrow.addWidget(self.cp_headers_btn)
+        _hrow.addWidget(self.cp_headers_tpl_btn)
+
+        self.cp_language = QComboBox()
         for code, label in MINIMAX_LANGUAGES.items():
-            self.mm_language.addItem(label, code)
-        self.mm_language.setToolTip(
+            self.cp_language.addItem(label, code)
+        self.cp_language.setToolTip(
             "留空 = 自动检测主语言 + 中英混说（官方推荐，跨语言内容更稳）。\n"
             "已知语言时显式指定，短音频 / 术语密集内容更稳。\n"
-            "注意：这是 HTTP **header** 不是 form 字段。\n"
-            "未授权的小语种会报错，本程序只暴露官方已支持列表。"
+            "注意：这是 HTTP **header** 不是 form 字段；\n"
+            "在请求头文件里写 language 会覆盖这里的值。"
         )
 
-        self.mm_mock = QCheckBox("Mock 模式（不调网络，返回 fake 文本，便于本地调试）")
-        self.mm_mock.setChecked(True)  # 默认开：没填 key 时不会真的调 API
+        self.cp_mock = QCheckBox("Mock 模式（不调网络，返回 fake 文本，便于本地调试）")
+        self.cp_mock.setChecked(True)  # 默认开：没填 key 时不会真的调 API
 
-        self.mm_role_separation = QCheckBox("分离说话人（云端 diarization，标注【S1】…）")
-        self.mm_role_separation.setToolTip(
+        self.cp_role_separation = QCheckBox("分离说话人（云端 diarization，标注【S1】…）")
+        self.cp_role_separation.setToolTip(
             "开启后用 response_format=verbose_json，输出每段带【S1】/【S2】标签。\n"
-            "MiniMax 自带说话人分离，不需要额外模型（比本地 FunASR+CAM++ 省事）。\n"
-            "⚠ 超过 500 秒会自动切段，而**每段独立重编 S1/S2、响应里没有跨段身份信息**：\n"
+            "需要服务端支持 verbose_json（响应里带 segments[] + n_speakers）。\n"
+            "⚠ 超过默认 500 秒会自动切段，而**每段独立重编 S1/S2、"
+            "响应里没有跨段身份信息**：\n"
             "  人数相同时只能按编号对齐，两人音色接近时可能认错人。\n"
-            "  需要严格一致的跨段身份 → 用讯飞（5 小时单文件，不用切段）。\n"
-            "⚠ 短对话（<500 秒不切段）时分离最可靠，推荐优先用这类素材。\n"
-            "⚠ 开启说话人/时间戳会切到 verbose_json，耗时略增。"
+            "⚠ 短素材（不切段）分离最可靠。"
         )
 
-        self.mm_timestamps = QCheckBox("输出时间戳（每段加 [MM:SS] 前缀）")
-        self.mm_timestamps.setChecked(True)
-        self.mm_timestamps.setToolTip(
+        self.cp_timestamps = QCheckBox("输出时间戳（每段加 [MM:SS] 前缀）")
+        self.cp_timestamps.setChecked(True)
+        self.cp_timestamps.setToolTip(
             "开启后每段前面加 [MM:SS] 时间戳（读 segments[].start，单位是**秒**）。\n"
-            "与 xf_asr / funasr 的时间戳格式保持一致。\n"
-            "verbose_json 下同一说话人的相邻文本会被合并成句段。"
+            "与 xf_asr / funasr 的时间戳格式保持一致。"
         )
 
-        self.mm_max_wait = QSpinBox()
-        self.mm_max_wait.setRange(30, 7200)
-        self.mm_max_wait.setValue(300)
-        self.mm_max_wait.setToolTip(
-            "单次 HTTP 请求超时（秒）。MiniMax 是一次性返回（非流式），\n"
-            "按官方参考：500 秒音频约几秒到几十秒返回。切段后每段各用一次。"
+        self.cp_max_wait = QSpinBox()
+        self.cp_max_wait.setRange(30, 7200)
+        self.cp_max_wait.setValue(300)
+        self.cp_max_wait.setToolTip(
+            "单次 HTTP 请求超时（秒）。默认按一次���返回（非流式），\n"
+            "500 秒音频约几秒到几十秒返回。切段后每段各用一次。"
         )
 
-        mmform.addRow("API Key", self.mm_api_key)
-        mmform.addRow("语言", self.mm_language)
-        mmform.addRow(self.mm_mock)
-        mmform.addRow(self.mm_role_separation)
-        mmform.addRow(self.mm_timestamps)
-        mmform.addRow("单请求超时（秒）", self.mm_max_wait)
+        mmform.addRow("接口地址（POST）", self.cp_endpoint)
+        mmform.addRow("API Key", self.cp_api_key)
+        mmform.addRow("请求头文件", self.cp_headers_row)
+        mmform.addRow("语言", self.cp_language)
+        mmform.addRow(self.cp_mock)
+        mmform.addRow(self.cp_role_separation)
+        mmform.addRow(self.cp_timestamps)
+        mmform.addRow("单请求超时（秒）", self.cp_max_wait)
         outer.addWidget(mm_box)
 
         mm_tip = QLabel(
-            "💡 MiniMax Speech-to-Text（asr-1.0，云端 API）：\n"
-            "  · 鉴权：Authorization: Bearer <API Key>（单件，讯飞要两件套）\n"
-            "  · 真 multipart 上传（与讯飞相反：讯飞必须 query string + raw body）\n"
-            "  · **硬限制：单请求 ≤ 500 秒 / 50 MB**，超了直接报错不截断\n"
-            "    → 程序会自动切 450 秒一段并压成单声道 16kHz mp3（识别精度不受影响）\n"
+            "💡 自定义 POST 云端 ASR（默认按 MiniMax asr-1.0 契约实现）：\n"
+            "  · 接口地址可改 → 指向私有部署 / 网关 / 任何兼容服务\n"
+            "  · 请求头走可编辑的 text 文件（每行 Key: Value，# 注释）\n"
+            "    该文件可能含密钥，已加入 .gitignore；程序只打印键名不打印值\n"
+            "  · 鉴权两处都行：API Key 输入框（Bearer）或请求头文件里写 Authorization\n"
+            "  · 请求是 multipart/form-data（与讯飞相反：讯飞必须 query string + raw body）\n"
+            "  · **默认硬限制：单请求 ≤ 500 秒 / 50 MB**，超了直接报错不截断\n"
+            "    → 程序自动切 450 秒一段并压成单声道 16kHz mp3（识别精度不受影响）\n"
+            "    → 换私有部署若限制不同，改 custom_post_asr.py 顶部 MAX_DURATION_SEC / MAX_FILE_BYTES\n"
             "  · verbose_json 才返回 segments[] + n_speakers（说话人分离 + 时间戳）\n"
-            "  · 按音频时长计费；余额不足返回 402\n"
-            "  · 说话人分离在 <500 秒（不切段）时最可靠；长音频切段后跨段身份无法保证\n"
-            "  · Key 申请：https://platform.minimax.cn/user-center/basic-information/interface-key"
+            "  · 错误体是 OpenAI 风格（400/401/402/403/404/413/422/429/500）\n"
+            "  · MiniMax Key 申请：https://platform.minimax.cn/user-center/basic-information/interface-key"
         )
         mm_tip.setWordWrap(True)
         mm_tip.setStyleSheet("color: #666; font-size: 11px;")
@@ -557,21 +595,34 @@ class SettingsDialog(QDialog):
                 self.xf_app_id.text().strip() and self.xf_secret_key.text().strip()
             )
             label = "讯飞听见"
-        elif engine == "minimax_asr":
-            has_creds = bool(self.mm_api_key.text().strip())
-            label = "MiniMax"
+            mock_box = self.xf_mock
+        elif engine == "custom_post":
+            # 凭证可能在 API Key 输入框，也可能在请求头文件的 Authorization 里
+            has_creds = bool(self.cp_api_key.text().strip())
+            if not has_creds:
+                try:
+                    from ...media.custom_post_asr import load_headers_file
+
+                    hp = (self.cp_headers_file.text().strip()
+                          or str(default_headers_file()))
+                    has_creds = any(
+                        k.lower() == "authorization" and v.strip()
+                        for k, v in load_headers_file(Path(hp)).items()
+                    )
+                except Exception:
+                    has_creds = False
+            label = "自定义 POST"
+            mock_box = self.cp_mock
         else:
             return
-        if has_creds:
-            mock_box = self.xf_mock if engine == "xf_asr" else self.mm_mock
-            if mock_box.isChecked():
-                mock_box.setChecked(False)
-                QMessageBox.information(
-                    self,
-                    f"{label} 已自动取消 Mock",
-                    f"检测到 {engine} 引擎 + 凭证齐全，自动取消 Mock 模式（避免误调 mock）。\n"
-                    f"如确实要本地调试，可重新勾选。",
-                )
+        if has_creds and mock_box.isChecked():
+            mock_box.setChecked(False)
+            QMessageBox.information(
+                self,
+                f"{label} 已自动取消 Mock",
+                f"检测到 {engine} 引擎 + 凭证齐全，自动取消 Mock 模式（避免误调 mock）。\n"
+                f"如确实要本地调试，可重新勾选。",
+            )
 
     def _on_xf_role_toggled(self, checked: bool) -> None:
         """2026-10-02：说话人分离开关 → 「发音人数」随之 enable/disable。
@@ -583,6 +634,49 @@ class SettingsDialog(QDialog):
     def _on_funasr_speaker_toggled(self, checked: bool) -> None:
         """2026-10-02：本地说话人分离开关 → 模型下拉随之 enable/disable。"""
         self.funasr_spk_model.setEnabled(bool(checked))
+
+    def _pick_custom_headers_file(self) -> None:
+        """选请求头文件（custom_post 引擎专用）。"""
+        cur = (self.cp_headers_file.text().strip()
+               or str(default_headers_file()))
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择自定义 POST ASR 的请求头文件",
+            cur,
+            "Text files (*.txt);;All files (*.*)",
+        )
+        if path:
+            self.cp_headers_file.setText(path)
+
+    def _make_custom_headers_template(self) -> None:
+        """生成请求头文件模板（已存在则提示，不静默覆盖）。"""
+        cur = (self.cp_headers_file.text().strip()
+               or str(default_headers_file()))
+        path = Path(cur)
+        existed = path.exists()
+        try:
+            write_headers_template(path, overwrite=False)
+        except OSError as e:
+            QMessageBox.warning(
+                self, "生成模板失败", f"无法写入 {path}：\n{e}"
+            )
+            return
+        if existed:
+            QMessageBox.information(
+                self,
+                "模板已存在",
+                f"{path}\n\n已存在，未覆盖（避免把你手写的请求头冲掉）。\n"
+                f"要重新生成请先删除该文件或换个路径。",
+            )
+        else:
+            self.cp_headers_file.setText(str(path))
+            QMessageBox.information(
+                self,
+                "已生成请求头模板",
+                f"{path}\n\n格式：每行一条 Key: Value，# 开头是注释。\n"
+                f"留空「API Key」时，在这里写 Authorization: <你的凭据> 也能鉴权。\n"
+                f"⚠ 该文件可能含密钥，已在 .gitignore 里，不要提交到仓库。",
+            )
 
     def _pick_qwen_context(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -856,19 +950,23 @@ class SettingsDialog(QDialog):
         self.xf_colloquial_proc.setChecked(bool(xa.get("colloquial_proc", True)))
         self.xf_timestamps.setChecked(bool(xa.get("timestamps", True)))
 
-        # MiniMax Speech-to-Text（minimax_asr 引擎专用，2026-10-02 新增）
-        ma = (tr.get("minimax_asr") or {})
-        self.mm_api_key.setText(str(ma.get("api_key") or ""))
-        mlang = str(ma.get("language") or "")
-        midx = self.mm_language.findData(mlang)
-        self.mm_language.setCurrentIndex(midx if midx >= 0 else 0)
-        self.mm_mock.setChecked(bool(ma.get("mock", True)))
-        self.mm_role_separation.setChecked(bool(ma.get("role_separation", False)))
-        self.mm_timestamps.setChecked(bool(ma.get("timestamps", True)))
+        # 自定义 POST 云端识别（custom_post 引擎，2026-10-02；旧名 minimax_asr 兼容）
+        ca = (tr.get("custom_post") or tr.get("minimax_asr") or {})
+        self.cp_endpoint.setText(
+            str(ca.get("endpoint") or DEFAULT_ENDPOINT)
+        )
+        self.cp_api_key.setText(str(ca.get("api_key") or ""))
+        self.cp_headers_file.setText(str(ca.get("headers_file") or ""))
+        clang = str(ca.get("language") or "")
+        cidx = self.cp_language.findData(clang)
+        self.cp_language.setCurrentIndex(cidx if cidx >= 0 else 0)
+        self.cp_mock.setChecked(bool(ca.get("mock", True)))
+        self.cp_role_separation.setChecked(bool(ca.get("role_separation", False)))
+        self.cp_timestamps.setChecked(bool(ca.get("timestamps", True)))
         try:
-            self.mm_max_wait.setValue(int(ma.get("max_wait_seconds") or 300))
+            self.cp_max_wait.setValue(int(ca.get("max_wait_seconds") or 300))
         except (TypeError, ValueError):
-            self.mm_max_wait.setValue(300)
+            self.cp_max_wait.setValue(300)
 
         yt = self._config.get("youtube") or {}
         browser = str(yt.get("cookies_from_browser") or "")
@@ -981,13 +1079,15 @@ class SettingsDialog(QDialog):
                     "colloquial_proc": self.xf_colloquial_proc.isChecked(),
                     "timestamps": self.xf_timestamps.isChecked(),
                 },
-                "minimax_asr": {
-                    "api_key": self.mm_api_key.text().strip(),
-                    "language": self.mm_language.currentData() or "",
-                    "mock": self.mm_mock.isChecked(),
-                    "role_separation": self.mm_role_separation.isChecked(),
-                    "timestamps": self.mm_timestamps.isChecked(),
-                    "max_wait_seconds": self.mm_max_wait.value(),
+                "custom_post": {
+                    "endpoint": self.cp_endpoint.text().strip() or DEFAULT_ENDPOINT,
+                    "api_key": self.cp_api_key.text().strip(),
+                    "headers_file": self.cp_headers_file.text().strip(),
+                    "language": self.cp_language.currentData() or "",
+                    "mock": self.cp_mock.isChecked(),
+                    "role_separation": self.cp_role_separation.isChecked(),
+                    "timestamps": self.cp_timestamps.isChecked(),
+                    "max_wait_seconds": self.cp_max_wait.value(),
                 },
             },
             "youtube": {

@@ -150,7 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--asr-engine",
         type=str,
         default=None,
-        choices=["funasr", "whisper", "qwen_asr", "xf_asr", "minimax_asr"],
+        choices=["funasr", "whisper", "qwen_asr", "xf_asr", "custom_post"],
         help="语音转文字引擎，未指定时读 config.transcribe.asr_engine，默认 funasr"
     )
     parser.add_argument(

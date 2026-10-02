@@ -1,41 +1,41 @@
-"""MiniMax 云端 ASR backend — Speech-to-Text REST API（2026-10-02 新增）。
+"""自定义 POST 云端 ASR backend —— 泛化的 Speech-to-Text REST 调用（2026-10-02）。
 
-MiniMax 开放平台: https://platform.minimax.cn/
-接口文档: https://platform.minimax.cn/docs/api-reference/speech-to-text
-OpenAPI: https://platform.minimax.cn/docs/api-reference/speech/speech-to-text/api/openapi.json
+本模块最早是「MiniMax STT 专用」，2026-10-02 泛化成**可自定义端点 + 可自定义请求头**，
+这样既能指向 MiniMax 官方，也能指向私有部署 / 网关 / 任何兼容这套请求-响应契约的服务。
 
-端点: POST https://api.minimax.cn/v1/speech_to_text
-鉴权: Authorization: Bearer <API_key>（单件，不像讯飞要 APPID+SecretKey 两件套）
+    端点 POST {endpoint}                    ← 用户可改（默认 MiniMax 官方）
+    鉴权 Authorization: Bearer <API Key>    ← 默认，也可被请求头文件覆盖
+    附加请求头                             ← 从程序内 text 文件读，用户可编辑
 
-## 协议要点（照 OpenAPI spec 抄，不猜）
+## 契约基线（照 MiniMax 官方 OpenAPI spec，不猜）
 
     Content-Type: multipart/form-data        ← 真正的 multipart！
     Authorization: Bearer <API_key>
     language: <BCP-47>                       ← 注意是 HTTP **header**，不是 form field
 
     form:
-      model            = "asr-1.0"           （必填，当前只有这一个模型）
+      model            = "asr-1.0"           （必填）
       file             = <binary>            （必填）
       response_format  = json | verbose_json | srt | vtt
       timestamp_level  = "" | sentence | word
       stream           = false
 
     ⚠ 与讯飞 lfasr 的协议正好相反：
-      讯飞 → query string + raw body（**不能**用 multipart，否则 26600）
-      MiniMax → 就是 multipart（form-data），跟官方 curl 示例一致
+      讯飞  → query string + raw body（**不能**用 multipart，否则 26600）
+      本模块 → 就是 multipart（form-data）
       写新引擎时别把讯飞那套 query string 习惯带过来。
 
-## 硬限制（决定了本模块的核心设计：必须切段）
+## 硬限制（默认针对 MiniMax，可被服务端改）
 
     时长 ≤ 500 秒   超了返回 400，不截断
     大小 ≤ 50 MB    超了返回 413
     格式  wav / aiff / flac / alac(m4a) / mp3 / aac / opus / ogg
     不支持无容器裸 PCM
 
-    500 秒 ≈ 8.3 分钟。讯飞是 5 小时，MiniMax 差了两个数量级。
+    500 秒 ≈ 8.3 分钟。讯飞是 5 小时，差了两个数量级。
     所以本模块**必须**切段（见 _split_audio_for_long），跟 xf_asr 的
     「永不切段」策略完全相反——两个都是云端，但上限不同。
-    （呼应 user memory：切段策略要按引擎的**真实上限**定，不是按「云端/本地」二分）
+    换私有部署时如果限制更宽/更窄，改 MAX_DURATION_SEC / MAX_FILE_BYTES 即可。
 
 ## 说话人分离 + 时间戳
 
@@ -61,9 +61,11 @@ OpenAPI: https://platform.minimax.cn/docs/api-reference/speech/speech-to-text/ap
 
 ## config.json 用法（transcribe 块加）
 
-    "asr_engine": "minimax_asr",
-    "minimax_asr": {
+    "asr_engine": "custom_post",
+    "custom_post": {
         "api_key": "your-api-key",
+        "endpoint": "https://api.minimax.cn/v1/speech_to_text",  ← 可改
+        "headers_file": "",        ← 留空 = 用程序内默认 custom_post_headers.txt
         "language": "zh",          # BCP-47；留空 = 自动检测 + 中英混说
         "mock": false,
         "role_separation": true,   # verbose_json（需配合 timestamps）
@@ -71,7 +73,8 @@ OpenAPI: https://platform.minimax.cn/docs/api-reference/speech/speech-to-text/ap
         "max_wait_seconds": 300
     }
 
-2026-10-02 新增：minimax_asr.py
+2026-10-02 新增：minimax_asr.py → 泛化为 custom_post_asr.py
+2026-10-02 兼容：config 里的 "asr_engine": "minimax_asr" 仍可用（打 WARNING 提示迁移）
 """
 from __future__ import annotations
 
@@ -84,19 +87,24 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ..logging_config import configure_logging
+from ..paths import APP_ROOT
 from ..text_utils import format_time
 
 logger = configure_logging()
 
 
-# MiniMax Speech-to-Text 端点
-_STT_URL = "https://api.minimax.cn/v1/speech_to_text"
+# 默认端点（用户可在 GUI 改成任意兼容服务）
+DEFAULT_ENDPOINT = "https://api.minimax.cn/v1/speech_to_text"
+LEGACY_ENDPOINT = DEFAULT_ENDPOINT
 _MODEL = "asr-1.0"
 
-# === 硬限制（OpenAPI spec 明确写出）===
+# 请求头文件：程序内，默认文件名。用戶可直接编辑（每行一条 Key: Value）
+HEADERS_FILENAME = "custom_post_headers.txt"
+
+# === 硬限制（针对 MiniMax 默认值；换私有部署可改这里）===
 MAX_DURATION_SEC = 500     # 时长上限，超了 400
 MAX_FILE_BYTES = 50 * 1024 * 1024  # 大小上限，超了 413
 
@@ -136,12 +144,14 @@ MINIMAX_LANGUAGES = {
 # 错误码 → 人话（用于把 OpenAI 风格的 error.message 翻译成可操作提示）
 _ERROR_HINTS = {
     400: "请求参数错误（最常见：音频超过 500 秒或格式不支持）",
-    401: "鉴权失败：检查 API Key 是否正确（控制台 → 账户管理 → 接口密钥）",
+    401: "鉴权失败：检查 API Key / 请求头文件里的 Authorization 是否正确",
     402: "账户余额不足：去 https://platform.minimax.cn/user-center/basic-information 充值",
+    403: "无权限：该端点拒绝了当前凭证（检查请求头文件里的鉴权信息）",
+    404: "端点不存在：检查「接口地址」填的 URL 是否正确",
     413: "音频超过 50 MB 上限：转成单声道 16kHz 或 mp3 压缩后再试",
     422: "音频内容涉及敏感内容，被平台拒绝",
     429: "触发限流：稍后重试",
-    500: "MiniMax 服务端错误：稍后重试",
+    500: "服务端错误：稍后重试",
 }
 
 # ffmpeg/ffprobe 路径（与 xf_asr 同款，优先项目内副本）
@@ -155,6 +165,123 @@ _FFPROBE_PATHS = [
 ]
 
 _cached_session: Optional[object] = None
+
+
+# ============ 请求头文件 ============
+
+def default_headers_file() -> Path:
+    """程序内默认请求头文件路径（与 exe / 源码同目录）。"""
+    return Path(APP_ROOT) / HEADERS_FILENAME
+
+
+def write_headers_template(path: Optional[Path] = None, overwrite: bool = False) -> Path:
+    """生成请求头文件模板（首次用 / 用户点「生成模板」时调用）。
+
+    只写占位说明，**不写入真实密钥**。
+    """
+    target = Path(path) if path else default_headers_file()
+    if target.exists() and not overwrite:
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        "# 自定义 POST ASR — 附加请求头\n"
+        "#\n"
+        "# 格式：每行一条  Key: Value\n"
+        "#  - # 开头是注释，空行忽略\n"
+        "#  - 这里的头会与程序自动生成的合并（同名以本文件为准）\n"
+        "#  - Authorization 通常在「API Key」输入框里填，不用写这里；\n"
+        "#    只有当服务端要求非 Bearer 鉴权时才写在这里\n"
+        "#  - 本文件可能含密钥，已加入 .gitignore，不要提交到仓库\n"
+        "#\n"
+        "# 例：私有部署要额外带一个 token 头\n"
+        "# X-Deploy-Token: your-token-here\n"
+        "#\n"
+        "# 例：走网关要加路由头\n"
+        "# X-Gateway-Route: asr-prod\n",
+        encoding="utf-8",
+    )
+    logger.info(f"已生成请求头模板: {target}")
+    return target
+
+
+def load_headers_file(path: Optional[Path] = None) -> Dict[str, str]:
+    """读请求头文件 → dict。文件不存在就生成模板并返回空 dict。
+
+    解析规则：
+      - 一行一条 `Key: Value`
+      - `#` 开头或行内 `  #` 之后是注释
+      - 空行忽略
+      - 没有冒号的行忽略（并 WARNING，避免静默吃掉用户的输入）
+      - 键大小写不敏感去重（后写的覆盖先写的）
+    """
+    target = Path(path) if path else default_headers_file()
+    if not target.exists():
+        write_headers_template(target)
+        return {}
+
+    headers: Dict[str, str] = {}
+    try:
+        raw = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        logger.warning(f"读取请求头文件失败（已忽略该文件）: {target} — {exc}")
+        return {}
+
+    for lineno, line in enumerate(raw.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # 去掉行内注释（要求 # 前有空白，避免砍掉 token 里的 #）
+        if " #" in line:
+            line = line.split(" #", 1)[0].strip()
+        if not line or ":" not in line:
+            if line:
+                logger.warning(
+                    f"请求头文件第 {lineno} 行没有 ':'，已忽略: {line[:60]!r}"
+                )
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        # 同名（忽略大小写）后写的覆盖
+        for existing in list(headers):
+            if existing.lower() == key.lower() and existing != key:
+                headers[key] = headers.pop(existing)
+                break
+        headers[key] = value
+
+    if headers:
+        # 只打印键名，绝不打印值（值里通常是密钥）
+        logger.info(f"已从 {target.name} 加载 {len(headers)} 个自定义请求头: {sorted(headers)}")
+    return headers
+
+
+def build_headers(
+    api_key: str,
+    language: str,
+    extra: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    """合并请求头：程序生成的 < 请求头文件 < 用户显式设置。
+
+    优先级（后者覆盖前者）：
+      1. `language`（程序按 config 生成；用户文件里写了 language 也以文件为准）
+      2. `Authorization`（有 api_key 才加；请求头文件里写了就以文件为准）
+      3. 请求头文件内容
+    """
+    headers: Dict[str, str] = {}
+    if language:
+        headers["language"] = language
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    for k, v in (extra or {}).items():
+        # 空值视为「用户想删掉这个头」
+        if v == "":
+            headers.pop(k, None)
+            continue
+        headers[k] = v
+    return headers
+
 
 
 # ============ 工具：ffmpeg / ffprobe / 切段 / 清理 ============
@@ -196,7 +323,7 @@ def _release_cached_session() -> None:
 
 def _cleanup_stale_chunk_dirs() -> None:
     """进程启动时清残留切段目录（GUI 强杀 / 崩溃场景）。"""
-    pattern = os.path.join(tempfile.gettempdir(), "minimax_asr_chunks_*")
+    pattern = os.path.join(tempfile.gettempdir(), "custom_post_asr_chunks_*")
     for d in glob.glob(pattern):
         shutil.rmtree(d, ignore_errors=True)
 
@@ -231,7 +358,7 @@ def _do_split(audio_path: Path, segment_sec: int) -> List[Path]:
     if not ffmpeg:
         logger.warning("ffmpeg 找不到，无法切段（超过 500 秒会被 MiniMax 拒绝）")
         return []
-    temp_dir = Path(tempfile.mkdtemp(prefix="minimax_asr_chunks_"))
+    temp_dir = Path(tempfile.mkdtemp(prefix="custom_post_asr_chunks_"))
     chunk_paths: List[Path] = []
     i = 0
     while True:
@@ -314,21 +441,21 @@ def _split_audio_for_long(audio_path: str, max_duration: float) -> Tuple[List[Pa
 
 # ============ 鉴权 / 参数校验 ============
 
-def _validate_credentials(api_key: str) -> None:
-    if not api_key:
+def _validate_credentials(has_creds: bool) -> None:
+    """凭证兜底校验。调用前已判定过，这里只防逻辑漏改。"""
+    if not has_creds:
         raise RuntimeError(
-            "MiniMax ASR 需要 API Key。请到 "
-            "https://platform.minimax.cn/user-center/basic-information/interface-key 查看，"
-            "填入「设置 → 转写 → MiniMax 高级」。"
-            "或勾「Mock 模式」跳过真实 API（用于本地调试）。"
+            "自定义 POST ASR 没有可用凭证（API Key 为空，且请求头文件里也没有 Authorization）。"
         )
 
 
 # ============ API 调用 ============
 
-def _extract_error(resp) -> str:
+def _extract_error(resp, url: str = "") -> str:
     """把 OpenAI 风格错误体翻译成可读的中文提示。"""
     hint = _ERROR_HINTS.get(resp.status_code, "")
+    if not hint and not url:
+        hint = "（非标准错误码；若用的是自定义端点，请对照该服务的文档）"
     detail = ""
     try:
         body = resp.json()
@@ -338,13 +465,15 @@ def _extract_error(resp) -> str:
     except Exception:
         detail = (resp.text or "")[:300]
         req_id = ""
-    parts = [f"MiniMax STT HTTP {resp.status_code}"]
+    parts = [f"自定义 POST ASR HTTP {resp.status_code}"]
     if hint:
         parts.append(hint)
     if detail:
         parts.append(f"服务端信息: {detail}")
     if req_id:
         parts.append(f"request_id={req_id}")
+    if url:
+        parts.append(f"端点={url}")
     return " | ".join(parts)
 
 
@@ -355,22 +484,20 @@ def _transcribe_one(
     role_separation: bool,
     timestamps: bool,
     max_wait: int,
+    endpoint: str = DEFAULT_ENDPOINT,
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> dict:
     """单文件真实 API 调用，返回解析后的 JSON dict。
 
     走真 multipart（与讯飞相反）。
     """
-    import requests  # noqa: F401  (确保 requests 存在，延迟 import 友好)
-
     session = _get_session()
     # verbose_json 同时给 segments[] + n_speakers；只要开分离或时间戳就必须用它
     need_verbose = bool(role_separation or timestamps)
     response_format = "verbose_json" if need_verbose else "json"
 
-    headers = {"Authorization": f"Bearer {api_key}"}
-    # language 是 HTTP header（不是 form field）—— 空值 = 自动检测 + 中英混说
-    if language:
-        headers["language"] = language
+    url = (endpoint or DEFAULT_ENDPOINT).strip() or DEFAULT_ENDPOINT
+    headers = build_headers(api_key, language, extra_headers)
 
     data = {
         "model": _MODEL,
@@ -383,21 +510,24 @@ def _transcribe_one(
 
     size_mb = audio_path.stat().st_size / 1024 / 1024
     logger.info(
-        f"上传到 MiniMax: {audio_path.name} ({size_mb:.2f}MB, "
-        f"format={response_format}, language={language or 'auto'})"
+        f"上传到自定义 POST ASR: {audio_path.name} ({size_mb:.2f}MB, "
+        f"format={response_format}, language={language or 'auto'})\n"
+        f"  端点: {url}\n"
+        f"  请求头键: {sorted(headers)}"
     )
 
     with open(audio_path, "rb") as f:
         files = {"file": (audio_path.name, f, "application/octet-stream")}
-        resp = session.post(_STT_URL, headers=headers, data=data, files=files,
+        resp = session.post(url, headers=headers, data=data, files=files,
                             timeout=max(30, max_wait))
     if resp.status_code != 200:
-        raise RuntimeError(_extract_error(resp))
+        raise RuntimeError(_extract_error(resp, url))
     try:
         return resp.json()
     except json.JSONDecodeError as exc:
         raise RuntimeError(
-            f"MiniMax 返回非 JSON (HTTP {resp.status_code}): {(resp.text or '')[:300]}"
+            f"自定义 POST ASR 返回非 JSON (HTTP {resp.status_code}, {url}): "
+            f"{(resp.text or '')[:300]}"
         ) from exc
 
 
@@ -496,15 +626,22 @@ def _build_speaker_map(
 
 # ============ 主入口 ============
 
-def transcribe_audio_with_minimax_asr(audio_path: str, config: dict) -> str:
-    """MiniMax 云端 ASR 主入口。
+def transcribe_audio_with_custom_post(audio_path: str, config: dict) -> str:
+    """自定义 POST 云端 ASR 主入口（默认端点 = MiniMax 官方，可改成任意兼容服务）。
 
     Args:
         audio_path: 音频文件路径
-        config:     config.json 中 transcribe.minimax_asr 块
+        config:     config.json 中 transcribe.custom_post 块
 
     Returns:
         转写文本
+
+    config 字段：
+      - api_key         API Key（写入 `Authorization: Bearer <key>`）
+      - endpoint        接口地址，默认 MiniMax 官方
+      - headers_file    请求头文件路径；留空 = 程序内 custom_post_headers.txt
+      - language        BCP-47；留空 = 自动检测
+      - role_separation / timestamps / max_wait_seconds / mock
 
     Raises:
         RuntimeError: 凭证缺失 / API 调用失败 / 切段失败
@@ -515,39 +652,63 @@ def transcribe_audio_with_minimax_asr(audio_path: str, config: dict) -> str:
         3. mock=false + 凭证缺失 → WARNING + 自动降级 mock
 
     切段行为（与 xf_asr **相反**）：
-        MiniMax 单请求 ≤500 秒 / 50 MB，超了必须切；讯飞是 5 小时不用切。
+        默认单请求 ≤500 秒 / 50 MB，超了必须切；讯飞是 5 小时不用切。
+        换私有部署时若限制不同，改模块顶部 MAX_DURATION_SEC / MAX_FILE_BYTES。
     """
     cfg = config or {}
     mock = bool(cfg.get("mock", False))
     api_key = (cfg.get("api_key") or "").strip()
+    endpoint = (cfg.get("endpoint") or DEFAULT_ENDPOINT).strip() or DEFAULT_ENDPOINT
     language = (cfg.get("language") or "").strip()
     role_separation = bool(cfg.get("role_separation", False))
     timestamps = bool(cfg.get("timestamps", True))
     max_wait = int(cfg.get("max_wait_seconds") or 300)
 
-    if mock or not api_key:
-        if mock and api_key:
+    # 请求头文件：留空用程序内默认文件
+    headers_path_raw = (cfg.get("headers_file") or "").strip()
+    headers_path = Path(headers_path_raw) if headers_path_raw else default_headers_file()
+    # 不存在会自动生成模板
+    extra_headers = load_headers_file(headers_path)
+
+    # 凭证可以来自两处：API Key 输入框，或请求头文件里的 Authorization。
+    # 后者支持非 Bearer 鉴权（私有部署常见），所以空 API Key 不等于没凭证。
+    def _has_auth(h: Dict[str, str]) -> bool:
+        return any(k.lower() == "authorization" and v.strip() for k, v in h.items())
+
+    has_creds = bool(api_key) or _has_auth(extra_headers)
+
+    if mock or not has_creds:
+        if mock and has_creds:
             logger.warning(
-                "minimax_asr 凭证已配置（API Key）但 Mock 模式仍勾选——"
-                "将走 Mock 不调真实 API。如需真实 API，请取消 Mock 勾选。"
+                "custom_post 凭证已配置（API Key 或请求头文件里的 Authorization）"
+                "但 Mock 模式仍勾选——将走 Mock 不调真实 API。"
+                "如需真实 API，请取消 Mock 勾选。"
             )
         elif mock:
-            logger.info("minimax_asr Mock 模式（显式勾选）—— 不调真实 API。")
+            logger.info("custom_post Mock 模式（显式勾选）—— 不调真实 API。")
         else:
             logger.warning(
-                "minimax_asr 凭证缺失，自动降级 Mock 模式（不调网络、不需要 key）。"
-                "如需真实 API，请配置 api_key 并取消 mock 勾选。"
+                "custom_post 凭证缺失，自动降级 Mock 模式（不调网络、不需要 key）。\n"
+                f"  填「API Key」输入框，或在请求头文件 {headers_path} 里写 "
+                "Authorization: <你的凭据>，然后取消 mock 勾选。"
             )
         return _mock_transcribe(audio_path)
 
-    _validate_credentials(api_key)
+    _validate_credentials(has_creds)
     audio_path_obj = Path(audio_path)
+
+    # 端点格式预检：早点报，比服务端 404 好查
+    if not endpoint.lower().startswith(("http://", "https://")):
+        raise RuntimeError(
+            f"接口地址必须以 http:// 或 https:// 开头，实得: {endpoint!r}。"
+            f"默认 MiniMax 官方地址是 {DEFAULT_ENDPOINT}"
+        )
 
     # 格式预检：裸 PCM 会被 400 拒，MP4/MKV 这类容器也不支持
     ext = audio_path_obj.suffix.lower()
     if ext not in SUPPORTED_EXTS:
         logger.warning(
-            f"文件后缀 {ext} 不在 MiniMax 支持列表（{'/'.join(sorted(SUPPORTED_EXTS))}）——"
+            f"文件后缀 {ext} 不在支持列表（{'/'.join(sorted(SUPPORTED_EXTS))}）——"
             "若报 400 请先转成 mp3/wav（程序下载音轨时默认就是 mp3）"
         )
 
@@ -559,25 +720,28 @@ def transcribe_audio_with_minimax_asr(audio_path: str, config: dict) -> str:
     try:
         if not is_chunked:
             result = _transcribe_one(
-                audio_path_obj, api_key, language, role_separation, timestamps, max_wait
+                audio_path_obj, api_key, language, role_separation, timestamps,
+                max_wait, endpoint=endpoint, extra_headers=extra_headers,
             )
             text = _assemble(
-                [result], role_separation, timestamps, chunk_durations=[duration if duration > 0 else 0.0]
+                [result], role_separation, timestamps,
+                chunk_durations=[duration if duration > 0 else 0.0],
             )
             logger.info(
-                f"MiniMax 转写完成 (耗时: {format_time(time.time() - start)}，"
+                f"自定义 POST ASR 转写完成 (耗时: {format_time(time.time() - start)}，"
                 f"共 {len(text)} 字符)"
             )
             return text
 
-        # === 切段路径：需要累加时间偏移 + 重映射说话人编号 ===
-        logger.info(f"MiniMax 长音频转写: {audio_path}（已切 {len(chunk_paths)} 段）")
+        # === 切段路径：需要累加时间偏移 + 说话人编号对齐 ===
+        logger.info(f"长音频转写: {audio_path}（已切 {len(chunk_paths)} 段）")
         results: List[dict] = []
         chunk_durations: List[float] = []
         for i, chunk in enumerate(chunk_paths, 1):
             logger.info(f"转写第 {i}/{len(chunk_paths)} 段: {chunk.name}")
             results.append(
-                _transcribe_one(chunk, api_key, language, role_separation, timestamps, max_wait)
+                _transcribe_one(chunk, api_key, language, role_separation, timestamps,
+                                max_wait, endpoint=endpoint, extra_headers=extra_headers)
             )
             chunk_durations.append(_probe_audio_duration(chunk))
 
@@ -586,12 +750,12 @@ def transcribe_audio_with_minimax_asr(audio_path: str, config: dict) -> str:
         )
         if role_separation and is_chunked:
             logger.info(
-                "注意：切段后 MiniMax 每段独立重编 S1/S2，响应里没有跨段身份信息——"
+                "注意：切段后服务端每段独立重编 S1/S2，响应里没有跨段身份信息——"
                 "人数相同时程序只能按编号对齐（可能认错人）。"
                 "需要严格的跨段说话人身份请用讯飞（5 小时单文件，不用切段）"
             )
         logger.info(
-            f"MiniMax 转写完成（{len(chunk_paths)} 段拼接, "
+            f"转写完成（{len(chunk_paths)} 段拼接, "
             f"耗时 {format_time(time.time() - start)}，共 {len(text)} 字符）"
         )
         return text
@@ -661,7 +825,25 @@ def _mock_transcribe(audio_path: str) -> str:
     duration = _probe_audio_duration(Path(audio_path))
     n = max(5, int(duration // 30) + 1) if duration > 0 else 5
     sentence = (
-        "（这是 MiniMax mock 模式的 fake 转写文本。"
-        "在「设置 → 转写 → MiniMax 高级」填入 API Key 并取消 mock 勾选即可调用真实 API。）"
+        "（这是自定义 POST ASR 的 mock 转写文本。"
+        "在「设置 → 转写 → 自定义（POST）高级」填入 API Key（或在请求头文件里写 "
+        "Authorization）并取消 mock 勾选即可调用真实接口。）"
     )
     return "\n".join([sentence] * min(n, 50))
+
+
+# ============ 旧引擎名兼容 ============
+
+def transcribe_audio_with_minimax_asr(audio_path: str, config: dict) -> str:
+    """**已弃用**的旧入口，转发到 transcribe_audio_with_custom_post()。
+
+    2026-10-02：本引擎从「MiniMax 专用」泛化成「自定义 POST」后保留此别名，
+    避免用户 config.json 里已保存的 "asr_engine": "minimax_asr" 静默失效
+    （那会回落到 funasr，用户以为在用云端其实在本地跑，很难查）。
+    """
+    logger.warning(
+        'asr_engine="minimax_asr" 已改名为 "custom_post"（本引擎已泛化为自定义 POST）。'
+        '本次仍按旧名执行，请把 config.json 里的 asr_engine 改成 "custom_post"，'
+        "并把 transcribe.minimax_asr 块改名为 transcribe.custom_post。"
+    )
+    return transcribe_audio_with_custom_post(audio_path, config)

@@ -36,6 +36,10 @@ config.json
 config - *.json
 config-*.json
 !config.example.json
+# 自定义 POST ASR 的请求头文件（可能含 Authorization / 网关 token，**绝对不入库**）
+# 模板由程序自动生成（custom_post_asr.write_headers_template）
+custom_post_headers.txt
+*_headers.txt
 data/
 models/
 output/

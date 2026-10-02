@@ -138,11 +138,11 @@ def _resolve_engine_config(config: dict | None, asr_engine: str) -> dict | None:
     2026-09-27 修：原本只装 transcribe.qwen_asr 块传给 audio.py，给 xf_asr 引擎也传 qwen_asr 配置
     → 凭证缺失误降 mock（xf_asr 看到 qwen_asr 配置里没有 app_id）。
     现在按 asr_engine 装对应块：
-      - qwen_asr → transcribe.qwen_asr 块
-      - xf_asr   → transcribe.xf_asr 块
-      - minimax_asr → transcribe.minimax_asr 块
-      - funasr   → transcribe 下所有 funasr_* 扁平键（2026-10-02：说话人分离等）
-      - 其它     → None（whisper 无需引擎专属配置）
+      - qwen_asr   → transcribe.qwen_asr 块
+      - xf_asr     → transcribe.xf_asr 块
+      - custom_post → transcribe.custom_post 块（旧名 minimax_asr 读同一块）
+      - funasr     → transcribe 下所有 funasr_* 扁平键（2026-10-02：说话人分离等）
+      - 其它       → None（whisper 无需引擎专属配置）
 
     返回 None 时由 audio.py 走引擎内置默认值。
     """
@@ -153,8 +153,11 @@ def _resolve_engine_config(config: dict | None, asr_engine: str) -> dict | None:
         return tr.get("qwen_asr", {})
     if asr_engine == "xf_asr":
         return tr.get("xf_asr", {})
+    if asr_engine == "custom_post":
+        return tr.get("custom_post", {})
     if asr_engine == "minimax_asr":
-        return tr.get("minimax_asr", {})
+        # 已弃用别名：优先读新块，没有再回落到旧块，避免用户改名后配置丢失
+        return tr.get("custom_post", {}) or tr.get("minimax_asr", {})
     if asr_engine == "funasr":
         # funasr 的配置是扁平的（funasr_cache_dir / funasr_speaker / ...），
         # 统一收进一个 dict 走 engine_config 通道，避免再加一个位置参数。

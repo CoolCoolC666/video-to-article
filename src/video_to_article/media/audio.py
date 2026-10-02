@@ -24,6 +24,7 @@ __all__ = [
     "transcribe_audio_with_funasr",
     "transcribe_audio_with_qwen_asr",
     "transcribe_audio_with_xf_asr",
+    "transcribe_audio_with_custom_post",
     "transcribe_audio_with_minimax_asr",
     "extract_funasr_text",
     "format_funasr_speaker_text",
@@ -585,10 +586,10 @@ def transcribe_audio(
     """Transcribe audio with the selected ASR engine.
 
     engine_config 是「当前引擎专属」的配置块：
-    - qwen_asr → config.transcribe.qwen_asr 块
-    - xf_asr   → config.transcribe.xf_asr 块
-    - minimax_asr → config.transcribe.minimax_asr 块
-    - funasr   → transcribe 下所有 funasr_* 扁平键（说话人分离 / 缓存目录等）
+    - qwen_asr   → config.transcribe.qwen_asr 块
+    - xf_asr     → config.transcribe.xf_asr 块
+    - custom_post → config.transcribe.custom_post 块（minimax_asr 旧名也读同一块）
+    - funasr     → transcribe 下所有 funasr_* 扁平键（说话人分离 / 缓存目录等）
     由调用方 (cli/processor) 按 asr_engine 装好对应块再传入，避免「给 xf_asr 传 qwen_asr 配置」导致凭证缺失误降 mock。
     """
     if asr_engine == "whisper":
@@ -612,11 +613,12 @@ def transcribe_audio(
         # 延迟 import：避免未装 requests 时启动报错（pyproject 已固定 requests>=2.31）
         from .xf_asr import transcribe_audio_with_xf_asr
         return transcribe_audio_with_xf_asr(audio_path, engine_config or {})
-    if asr_engine == "minimax_asr":
-        # 2026-10-02 新增：MiniMax Speech-to-Text 云端识别 backend
-        # 同样是凭证缺失自动降级 mock；切段策略与 xf_asr 相反（500s 上限必须切）
-        from .minimax_asr import transcribe_audio_with_minimax_asr
-        return transcribe_audio_with_minimax_asr(audio_path, engine_config or {})
+    if asr_engine in ("custom_post", "minimax_asr"):
+        # 2026-10-02 新增：自定义 POST 云端识别 backend
+        # （原 MiniMax 专用，泛化成端点+请求头都可配；minimax_asr 为旧名兼容）
+        # 凭证缺失自动降级 mock；切段策略与 xf_asr 相反（默认 500s 上限必须切）
+        from .custom_post_asr import transcribe_audio_with_custom_post
+        return transcribe_audio_with_custom_post(audio_path, engine_config or {})
     raise ValueError(f"不支持的 ASR 引擎: {asr_engine}")
 
 

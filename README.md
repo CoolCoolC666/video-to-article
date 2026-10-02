@@ -32,7 +32,8 @@
 
 - 多平台链接下载（B 站 / YouTube / 抖音 / 小红书 / 微博等，能力随 [yt-dlp](https://github.com/yt-dlp/yt-dlp) 更新）
 - 本地音频、视频直接转写
-- 默认本地 ASR（FunASR SenseVoice），可选 Whisper
+- 默认本地 ASR（FunASR SenseVoice，可挂 CAM++ 分离说话人），可选 Whisper / Qwen3-ASR / 讯飞听见 / MiniMax
+- 云端引擎（讯飞 / MiniMax）支持说话人分离 + 时间戳，输出格式三引擎统一
 - 大模型按**提示词模板**生成成稿；也可仅下载、不转写
 - 桌面 GUI（单条 / 批量 / B 站搜索 / 仅下载 / 补跑工具）
 
@@ -202,7 +203,51 @@ python packaging/make_models_funasr_zip.py
 
 ## 本 fork 改动
 
-本 fork ([CoolCoolC666/video-to-article](https://github.com/CoolCoolC666/video-to-article)) 基于 [DEKVIW/video-to-article](https://github.com/DEKVIW/video-to-article) v0.4.5，从零**新增 Qwen3-ASR 引擎支持**（DEKVIW 上游仅有 FunASR / Whisper）并围绕它做了一系列增强。
+本 fork ([CoolCoolC666/video-to-article](https://github.com/CoolCoolC666/video-to-article)) 基于 [DEKVIW/video-to-article](https://github.com/DEKVIW/video-to-article) v0.4.5，从零**新增 3 个 ASR 引擎**（Qwen3-ASR / 讯飞听见 xf_asr / MiniMax minimax_asr）并围绕它们做了一系列增强。
+
+### ASR 引擎总览
+
+| 引擎 | 本地/云端 | 单请求上限 | 长音频策略 | 说话人分离 | 鉴权 |
+|------|----------|-----------|-----------|-----------|------|
+| `funasr` | 本地 | 受本机算力 | 本地切段（无限制） | ✅ 挂 CAM++（约 28MB） | 无 |
+| `qwen_asr` | 本地 | 受显存 | **必须切**（>7.5min 切 5min） | ❌ 不支持 | 无 |
+| `xf_asr`（讯飞） | 云端 | **5 小时 / 500MB** | **不切段**（整段直传） | ✅ 云端 `roleType` | APPID + SecretKey |
+| `minimax_asr`（MiniMax） | 云端 | **500 秒 / 50MB** | **必须切**（>450s 切 450s） | ✅ 云端 `verbose_json` | API Key（单件） |
+
+> ⚠ **切段策略不能按「本地 / 云端」二分**，必须看每个引擎的**真实上限**。
+> 讯飞和 MiniMax 都是云端，但上限差了 8 倍（5 小时 vs 500 秒），策略完全相反。
+
+### 新增：MiniMax Speech-to-Text（minimax_asr）
+
+fork **新增** `src/video_to_article/media/minimax_asr.py`，按官方 OpenAPI spec 实现（[接口文档](https://platform.minimax.cn/docs/api-reference/speech-to-text)）：
+
+```
+端点   POST https://api.minimax.cn/v1/speech_to_text
+鉴权   Authorization: Bearer <API Key>     ← 单件，不像讯飞要两件套
+模型   asr-1.0
+```
+
+| 改动 | 内容 | 为什么改 |
+|------|------|----------|
+| **真 multipart 上传** | `files={"file": (name, f, "application/octet-stream")}` + form 字段 `model`/`response_format`/`timestamp_level`/`stream` | **与讯飞正好相反**：讯飞必须 query string + raw body（走 multipart 报 26600），MiniMax 就是 multipart。写新引擎时别把讯飞那套习惯带过来 |
+| **`language` 走 HTTP header** | BCP-47 标签放请求头，**不是 form 字段**；留空 = 自动检测 + 中英混说 | 放错位置会被静默忽略 |
+| **强制切段 450 秒** | 超过 500 秒或 50MB → ffmpeg 切段并转单声道 16kHz 32kbps mp3 | 单请求 ≤ 500 秒 / 50 MB，**超了直接报错不截断**。留 50 秒余量：ffprobe 探测有误差，卡着 500s 切必 400 |
+| **切段失败抛明确错误** | 指向 ffmpeg 检查，不静默直传 | 静默直传 = 服务端 400，比本地报错难查 |
+| **`verbose_json` 才拿分离+时间戳** | 开任一开关就切 verbose_json，一律 `stream=false` | spec 明写 verbose_json/srt/vtt **不能**与 `stream=true` 同用 |
+| **跨段时间戳累加** | 每段 `start` 从 0 重新计，拼接时加段偏移，得到全局时间轴 | 官方返回的 `start`/`end` 单位是**秒**（float），与讯飞的毫秒相反 |
+| **跨段说话人编号对齐** | 人数变多时分配新编号（S3…） | ⚠ 见下方「能力边界」 |
+| **6 类错误码翻成中文** | 400/401/402/413/422/429 逐条给可操作提示，附 `request_id` | 400/413 的提示直接指向「转成单声道 16kHz 或 mp3 压缩」这个具体动作 |
+| **Mock 三分支** | 与 xf_asr 行为一致（凭证齐全却勾 mock 也给 WARNING） | 用户在两个云端引擎间切换时心智统一 |
+
+**配置位置**：「设置 → 转写 → MiniMax 高级」。CLI 用 `--asr-engine minimax_asr`。
+
+**Key 申请**：https://platform.minimax.cn/user-center/basic-information/interface-key
+
+> ⚠ **说话人分离的能力边界（务必读）**：切段后 MiniMax 每个独立请求都**从 S1 重新编号**，
+> 响应里**没有任何跨段身份信息**。所以：
+> - **< 500 秒（不切段）的短对话分离最可靠**，推荐优先用这类素材
+> - 切段后段间人数相同时只能按编号对齐；两人音色接近且编号互换了会认错
+> - 需要**严格一致的跨段说话人身份** → 用 `xf_asr`（5 小时单文件不切段）
 
 ### 新增：Qwen3-ASR 引擎
 
@@ -334,9 +379,9 @@ xf_asr 集成期间按以下顺序踩坑订正协议层（每个 fix 都加 smok
 
 ### 测试 / 工程
 
-- **10 个 smoke 脚本移到 `tests/`**（`smoke_settings / fallback / language / jp_kr / release / cleanup / thinking / xf_asr / xf_e2e / funasr_speaker`）
-  - 验证 GUI 字段读写、device fallback、language 兜底、释放按钮、清理按钮、xf_asr 鉴权签名 / upload 协议 / poll 状态码 / orderResult 解析 / 说话人分离 / 增强参数降级、FunASR CAM++ 模型解析 / sentence_info 格式化 / 富标签剥离 / config 装包
-  - 10 套全过，共 70+ 断言
+- **11 个 smoke 脚本移到 `tests/`**（`smoke_settings / fallback / language / jp_kr / release / cleanup / thinking / xf_asr / xf_e2e / funasr_speaker / minimax_asr`）
+  - 验证 GUI 字段读写、device fallback、language 兜底、释放按钮、清理按钮、xf_asr 鉴权签名 / upload 协议 / poll 状态码 / orderResult 解析 / 说话人分离 / 增强参数降级、FunASR CAM++ 模型解析 / sentence_info 格式化 / 富标签剥离、minimax_asr 协议契约 / 切段阈值 / 跨段偏移 / 错误码 / 四处注册点
+  - 11 套全过，共 90+ 断言
   - `tests/README.md` 说明运行方式（从仓库根跑）
 - **`.gitignore` 加严**：
   - 新增 `pip-unpack-*/` `run_e2e_main.log` `__tmp_*` `*.bak` `config.json.bak*`

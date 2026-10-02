@@ -652,6 +652,61 @@ def test_endpoint_and_headers():
     finally:
         if os.path.exists(hpath):
             os.unlink(hpath)
+
+    # === 9f: GUI 的「生成模板」按钮路径 ===
+    # 2026-10-02 修：_make_custom_headers_template 用了 Path() 但 settings_dialog
+    # 没 import Path → NameError。之前的测试只测了底层 write_headers_template，
+    # **从没调用过这个 GUI 方法**，所以漏了。
+    # 这里必须真的调一次（弹窗用 stub 掉，否则 offscreen 下会阻塞等点击）。
+    from PySide6.QtWidgets import QApplication
+    import video_to_article.gui.settings.settings_dialog as sd_mod
+    from video_to_article.gui.settings.settings_dialog import SettingsDialog
+    from video_to_article import config as cfg_mod
+
+    app = QApplication.instance() or QApplication([])
+    cfg_mod.load_config = lambda: {"transcribe": {}}
+    sd_mod.load_config = lambda: {"transcribe": {}}
+    dlg = SettingsDialog()
+
+    # 弹窗 stub：记录调用次数，不阻塞
+    boxes: list = []
+    orig_info = sd_mod.QMessageBox.information
+    orig_warn = sd_mod.QMessageBox.warning
+    sd_mod.QMessageBox.information = staticmethod(
+        lambda *a, **k: boxes.append(a[1] if len(a) > 1 else "")
+    )
+    sd_mod.QMessageBox.warning = staticmethod(
+        lambda *a, **k: boxes.append(a[1] if len(a) > 1 else "")
+    )
+    gpath = os.path.join(tempfile.gettempdir(), "smoke_gui_tpl.txt")
+    try:
+        if os.path.exists(gpath):
+            os.unlink(gpath)
+        dlg.cp_headers_file.setText(gpath)
+        dlg._make_custom_headers_template()  # ← 之前漏测的就是这一行
+        assert os.path.exists(gpath), "点「生成模板」应真的把文件写出来"
+        assert gpath == dlg.cp_headers_file.text().strip(), (
+            "生成后应自动回填路径，省得用户再手动填"
+        )
+        assert boxes, "生成模板后应弹窗告知用户"
+
+        # 幂等：已存在时不覆盖 + 明确告知
+        with open(gpath, "w", encoding="utf-8") as f:
+            f.write("X-My-Own: keep-me")
+        boxes.clear()
+        dlg._make_custom_headers_template()
+        assert open(gpath, encoding="utf-8").read() == "X-My-Own: keep-me", (
+            "已存在时不该覆盖用户手写内容"
+        )
+        assert any("已存在" in b for b in boxes), (
+            f"已存在时应明确提示而不是静默，boxes={boxes!r}"
+        )
+        print("OK 9f: GUI「生成模板」按钮可调（写文件 + 回填路径 + 不覆盖 + 弹窗）")
+    finally:
+        sd_mod.QMessageBox.information = orig_info
+        sd_mod.QMessageBox.warning = orig_warn
+        if os.path.exists(gpath):
+            os.unlink(gpath)
     print("OK 9: 端点可配 + 请求头文件全链路对\n")
 
 

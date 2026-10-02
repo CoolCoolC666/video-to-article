@@ -272,9 +272,9 @@ xf_asr 集成期间按以下顺序踩坑订正协议层（每个 fix 都加 smok
 
 | 引擎 | 说话人分离 | 说明 |
 |------|-----------|------|
+| **funasr（本地）** | ✅ 支持（2026-10-02 接入） | 需额外挂 CAM++ 嵌入模型 `spk_model="cam++"`，见下方「FunASR 高级」 |
 | **xf_asr（讯飞）** | ✅ 支持 | 需账号开通「角色分离」权限；未开通时本 fork 自动降级不报错 |
 | **qwen_asr（Qwen3-ASR）** | ❌ **不支持** | 多个独立实测一致：「目前版本不支持自动说话人分离，会把多人对话识别为连续文本」；官方把「需要说话人分离的会议记录」列为谨慎使用场景 |
-| **funasr** | ⚠️ 需额外挂 CAM++ | 单独 `AutoModel(..., spk_model="cam++")` 才能分离，SenseVoice 自身不产角色号。本 fork 暂未接 |
 | **whisper** | ❌ 不支持 | 需外挂 pyannote 等第三方模型 |
 
 > **Qwen3-ASR 实测原文**（两处独立来源一致）：
@@ -283,7 +283,29 @@ xf_asr 集成期间按以下顺序踩坑订正协议层（每个 fix 都加 smok
 >
 > 来源：[Qwen3-ASR 服务实测](https://blog.csdn.net/)、[Qwen3-ASR-0.6B 实测](https://blog.csdn.net/weixin_36296444/article/details/157788729)
 
-**关于「省算力」的澄清**：xf_asr 的说话人分离是**云端**能力，不占本地 GPU，开关的意义是「要不要为这个能力承担不准确风险」；Qwen3-ASR 是**根本做不到**，开关没意义；真要在本地分离只能上 FunASR + CAM++，那才会多占显存——如果哪天要接，算力开关做在那条路上。
+#### 本地说话人分离：FunASR + CAM++（2026-10-02 新增）
+
+| 改动 | 内容 | 为什么改 |
+|------|------|----------|
+| **CAM++ 模型解析** | `resolve_funasr_spk_model_name()` 别名归一（`cam++` / `CAM++` / `campplus`）+ 本地快照优先（ASCII 路径优先，避免中文路径） | 与既有 `resolve_funasr_vad_model_name()` 同款策略 |
+| **`spk_model` 传给 `AutoModel`** | 开了分离就传 `spk_model=<cam++ 路径或 ID>`，**必须与 `vad_model` 一起传** | FunASR 官方约束：说话人聚类在 VAD 流水线里做，只传 `spk_model` 或 `return_spk_res=True` 对直接推理无效 |
+| **`sentence_info` 格式化** | `format_funasr_speaker_text()` → `[MM:SS] 【说话人N】文本`，格式与 xf_asr 完全一致 | `spk` 是匿名的录音内标签，映射成连续编号（`spk=0`→`说话人1`）读起来更顺 |
+| **富标签剥离** | 剥掉 SenseVoice 的 `<\|zh\|><\|HAPPY\|><\|Speech\|>` 之类标记 | 不剥会污染说话人行的排版。官方 `rich_transcription_postprocess` 是有损展示函数（还做文本替换），这里只做最小必要的去标签，不改动既有非分离路径行为 |
+| **两个键名都读** | `sent["sentence"]`（blog demo）和 `sent["text"]`（go/sensevoice demo）都读 | 官方两处 demo 键名不一致，照抄任何一处都可能踩空 |
+| **拿不到就退回** | 没有 `sentence_info` 时自动走 `extract_funasr_text()` 纯文本路径 + WARNING | 可选能力不能变成硬失败 |
+| **GUI「FunASR 高级」GroupBox** | 分离说话人 + 说话人模型下拉 + 时间戳三个控件，模型下拉随分离开关联动置灰 | 与既有「Qwen3-ASR 高级」「讯飞听见 高级」风格一致 |
+
+**关于算力**（这一条容易被误解）：
+
+| 引擎 | 说话人分离的开销性质 |
+|------|-------------------|
+| funasr + CAM++ | **本地**，约 28MB 嵌入模型（非生成式），CPU 即可跑、**不占 GPU 显存**；额外开销 = 多加载一个小模型 + 一次聚类 |
+| xf_asr | **云端**，不占本地算力；开销是讯飞时长额度 + 准确率风险 |
+| qwen_asr | **做不到**，开关无意义 |
+
+所以「为了省算力」这个开关只对 FunASR 有意义（关掉就少加载一个模型、少一次聚类），对 Qwen3-ASR 是伪命题。
+
+**配置位置**：「设置 → 转写 → FunASR 高级」。首次开启会从 ModelScope 下载约 28MB 到 FunASR 缓存目录（路径规则见上文「离线模型怎么放」）。
 
 ### Qwen3-ASR 引擎的健壮性增强
 
@@ -312,9 +334,9 @@ xf_asr 集成期间按以下顺序踩坑订正协议层（每个 fix 都加 smok
 
 ### 测试 / 工程
 
-- **9 个 smoke 脚本移到 `tests/`**（`smoke_settings / fallback / language / jp_kr / release / cleanup / thinking / xf_asr / xf_e2e`）
-  - 验证 GUI 字段读写、device fallback、language 兜底、释放按钮、清理按钮、xf_asr 鉴权签名 / upload 协议 / poll 状态码 / orderResult 解析 / 说话人分离 / 增强参数降级
-  - 9 套全过，共 60+ 断言
+- **10 个 smoke 脚本移到 `tests/`**（`smoke_settings / fallback / language / jp_kr / release / cleanup / thinking / xf_asr / xf_e2e / funasr_speaker`）
+  - 验证 GUI 字段读写、device fallback、language 兜底、释放按钮、清理按钮、xf_asr 鉴权签名 / upload 协议 / poll 状态码 / orderResult 解析 / 说话人分离 / 增强参数降级、FunASR CAM++ 模型解析 / sentence_info 格式化 / 富标签剥离 / config 装包
+  - 10 套全过，共 70+ 断言
   - `tests/README.md` 说明运行方式（从仓库根跑）
 - **`.gitignore` 加严**：
   - 新增 `pip-unpack-*/` `run_e2e_main.log` `__tmp_*` `*.bak` `config.json.bak*`

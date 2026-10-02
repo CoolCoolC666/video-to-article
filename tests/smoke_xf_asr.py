@@ -424,7 +424,9 @@ def test_poll_result_status_codes():
     try:
         # 用补丁让 _parse_result_content 返回固定文本（避免依赖 resultMap 结构）
         original_parse = xf._parse_result_content
-        xf._parse_result_content = lambda content: parsed_text
+        # 2026-10-02：_poll_result 现在带 kwargs 调 _parse_result_content
+        # （role_separation / timestamps），lambda 必须收 **kwargs 否则 TypeError
+        xf._parse_result_content = lambda content, **kwargs: parsed_text
         try:
             text = xf._poll_result(
                 task_id="fake-order-id",
@@ -459,6 +461,9 @@ def test_parse_result_content():
 
     user 实测三次都 KeyError 在 status==4 之前的轮询层，从未到 _parse_result_content，
     这次主动加 smoke 验证契约，省一次 5.74MB 上传 + 配额消耗。
+
+    2026-10-02 行为变更：输出从「整段拼成一行」改成「每段一行」——
+    因为要支持时间戳 [MM:SS] 和 【说话人N】 前缀，必须按段分行才有意义。
     """
     import video_to_article.media.xf_asr as xf
 
@@ -477,9 +482,11 @@ def test_parse_result_content():
         ]
     })
     content_a = {"orderResult": order_result_caicongbo}
+    # 默认 role_separation=False + timestamps=True，但这两段没有 bg/begin
+    # → 时间戳条件（begin_ms > 0）不成立 → 退化成纯文本两行
     text_a = xf._parse_result_content(content_a)
-    assert text_a == "你好世界", (
-        f"caitongbo 风格应拼出 '你好世界'，实得 {text_a!r}"
+    assert text_a == "你好\n世界", (
+        f"caitongbo 风格应每段一行，实得 {text_a!r}"
     )
     print(f"OK 10a: caitongbo 风格（json_1best 是字符串）→ {text_a!r}")
 
@@ -542,6 +549,259 @@ def test_parse_result_content():
     print("OK 10: _parse_result_content 解析契约对（caitongbo + csdn + 防御 + fallback）\n")
 
 
+def test_role_separation_and_timestamps():
+    """11. 说话人分离 + 时间戳解析（2026-10-02 新增）。
+
+    验证点：
+      1. st.rl（角色编号）被读出来并映射成【说话人N】（rl=0 → 说话人1）
+      2. lattice2 顶层 begin（毫秒）被读出来转成 [MM:SS]
+      3. role_separation=False 时不输出任何说话人标签
+      4. timestamps=False 时不输出时间戳
+      5. 响应里没有 rl/spk 时（账号未开通角色分离）自动退回纯文本，不输出空标签
+    """
+    import video_to_article.media.xf_asr as xf
+
+    def _seg(rl, begin, text):
+        return {
+            "begin": begin, "end": begin + 2000, "spk": rl,
+            "json_1best": {
+                "st": {
+                    "rl": rl, "bg": begin, "ed": begin + 2000,
+                    "rt": [{"ws": [{"cw": [{"w": t} for t in text]}]}],
+                }
+            },
+        }
+
+    # === 两段对话：A(rl=0) @ 3.2s，B(rl=1) @ 65s ===
+    dialogue = json.dumps({
+        "lattice2": [
+            _seg("0", 3200, "你好我是老师"),
+            _seg("1", 65000, "老师好我是学生"),
+        ]
+    })
+    content = {"orderResult": dialogue}
+
+    # === 1. 说话人 + 时间戳都开 ===
+    both = xf._parse_result_content(
+        content, role_separation=True, timestamps=True
+    )
+    lines = both.split("\n")
+    assert len(lines) == 2, f"应 2 行，实得 {len(lines)}: {both!r}"
+    assert lines[0].startswith("[00:03]"), f"第 1 行时间戳错: {lines[0]!r}"
+    assert "【说话人1】" in lines[0], f"第 1 行应带【说话人1】: {lines[0]!r}"
+    assert lines[0].endswith("你好我是老师"), f"第 1 行文本错: {lines[0]!r}"
+    assert lines[1].startswith("[01:05]"), f"第 2 行时间戳错: {lines[1]!r}"
+    assert "【说话人2】" in lines[1], f"第 2 行应带【说话人2】: {lines[1]!r}"
+    print(f"OK 11a: 说话人 + 时间戳 →\n{both}")
+
+    # === 2. 说话人 + 时间戳都关 → 纯文本两行 ===
+    plain = xf._parse_result_content(
+        content, role_separation=False, timestamps=False
+    )
+    assert plain == "你好我是老师\n老师好我是学生", (
+        f"都关时应是纯文本两行，实得 {plain!r}"
+    )
+    print(f"OK 11b: 都关 → 纯文本 {plain!r}")
+
+    # === 3. 只开说话人 ===
+    only_spk = xf._parse_result_content(
+        content, role_separation=True, timestamps=False
+    )
+    assert only_spk == "【说话人1】你好我是老师\n【说话人2】老师好我是学生", (
+        f"只开说话人应只有标签，实得 {only_spk!r}"
+    )
+    print(f"OK 11c: 只开说话人 → {only_spk!r}")
+
+    # === 4. 只开时间戳 ===
+    only_ts = xf._parse_result_content(
+        content, role_separation=False, timestamps=True
+    )
+    assert only_ts == "[00:03] 你好我是老师\n[01:05] 老师好我是学生", (
+        f"只开时间戳应只有时间戳，实得 {only_ts!r}"
+    )
+    print(f"OK 11d: 只开时间戳 → {only_ts!r}")
+
+    # === 5. 响应里没有 spk/rl（账号未开通角色分离）→ 退回纯文本，不输出空标签 ===
+    no_spk = json.dumps({
+        "lattice": [{
+            "json_1best": json.dumps({
+                "st": {"bg": "1000", "ed": "3000",
+                       "rt": [{"ws": [{"cw": [{"w": "无角色"}]}]}]}
+            })
+        }]
+    })
+    fallback = xf._parse_result_content(
+        {"orderResult": no_spk}, role_separation=True, timestamps=True
+    )
+    assert "【" not in fallback, (
+        f"没解析到角色时不应输出空标签，实得 {fallback!r}"
+    )
+    assert fallback == "[00:01] 无角色", (
+        f"应保留时间戳但不带说话人，实得 {fallback!r}"
+    )
+    print(f"OK 11e: 无 spk/rl 字段 → 退回不带标签 {fallback!r}")
+
+    # === 6. 时间格式：超过 1 小时带小时位 ===
+    assert xf._format_ms(0) == "00:00:00"
+    assert xf._format_ms(3200) == "00:03"
+    assert xf._format_ms(65_000) == "01:05"
+    assert xf._format_ms(3_723_000) == "01:02:03", (
+        f"超过 1 小时应带小时位，实得 {xf._format_ms(3_723_000)!r}"
+    )
+    print("OK 11f: 时间格式（< 1h 无小时位 / ≥ 1h 带小时位）")
+
+    print("OK 11: 说话人分离 + 时间戳解析契约对\n")
+
+
+def test_enhanced_params_and_degrade():
+    """12. 增强参数上传契约 + 失败自动降级（2026-10-02 新增）。
+
+    官方 Java SDK 文档：role_type「只有在开通了角色分离功能的前提下才会生效」，
+    且「发音人分离目前还是测试效果达不到商用标准」。所以增强参数被拒时
+    必须自动退回最小参数集重试，而不是让整次转写失败。
+    """
+    import video_to_article.media.xf_asr as xf
+    from urllib.parse import urlparse, parse_qs
+
+    audio = _make_test_audio(seconds=1)
+
+    # === Case A: 全部增强参数都开 → query 里应有 4 个新 key ===
+    captured: list = []
+
+    class FakeResp:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class FakeSession:
+        def __init__(self, first_payload):
+            self.first_payload = first_payload
+
+        def post(self, url, headers=None, data=None, timeout=None):
+            captured.append(url)
+            if len(captured) == 1:
+                return FakeResp(self.first_payload)
+            return FakeResp(
+                {"code": "000000", "descInfo": "success",
+                 "content": {"orderId": "degraded-order-id"}}
+            )
+
+    ok_payload = {
+        "code": "000000", "descInfo": "success",
+        "content": {"orderId": "ok-order-id"},
+    }
+    xf._cached_session = FakeSession(ok_payload)
+    try:
+        tid = xf._upload_audio(
+            audio,
+            app_id="test_app_id_xyz",
+            secret_key="test_secret_key_abc",
+            language="cn",
+            role_separation=True,
+            role_num=2,
+            pd_domain="edu",
+            colloquial_proc=True,
+        )
+    finally:
+        xf._release_cached_session()
+        if os.path.exists(audio):
+            os.unlink(audio)
+
+    assert tid == "ok-order-id", f"应一次成功返回 orderId，实得 {tid!r}"
+    assert len(captured) == 1, f"成功时不该重试，实得 {len(captured)} 次请求"
+    qs = parse_qs(urlparse(captured[0]).query)
+    assert qs["roleType"] == ["1"], f"roleType 应为 1，实得 {qs.get('roleType')}"
+    assert qs["roleNum"] == ["2"], f"roleNum 应为 2，实得 {qs.get('roleNum')}"
+    assert qs["pd"] == ["edu"], f"pd 应为 edu，实得 {qs.get('pd')}"
+    assert qs["eng_colloqproc"] == ["true"], (
+        f"eng_colloqproc 应为 true，实得 {qs.get('eng_colloqproc')}"
+    )
+    # 最小参数集不能被增强参数挤掉
+    for k in ("appId", "signa", "ts", "fileSize", "fileName", "language", "duration"):
+        assert k in qs, f"最小参数集 {k} 丢了"
+    print(f"OK 12a: 全部增强参数上到 URL → roleType/roleNum/pd/eng_colloqproc ✓")
+
+    # === Case B: 增强参数被拒（26600）→ 自动退回最小参数集重试一次 ===
+    audio2 = _make_test_audio(seconds=1)
+    captured2: list = []
+
+    class DegradeSession:
+        def post(self, url, headers=None, data=None, timeout=None):
+            captured2.append(url)
+            if len(captured2) == 1:
+                return FakeResp(
+                    {"code": "26600", "descInfo": "转写业务通用错误"}
+                )
+            return FakeResp(
+                {"code": "000000", "descInfo": "success",
+                 "content": {"orderId": "fallback-order-id"}}
+            )
+
+    xf._cached_session = DegradeSession()
+    try:
+        tid2 = xf._upload_audio(
+            audio2,
+            app_id="test_app_id_xyz",
+            secret_key="test_secret_key_abc",
+            language="cn",
+            role_separation=True,
+            role_num=2,
+            pd_domain="edu",
+        )
+    finally:
+        xf._release_cached_session()
+        if os.path.exists(audio2):
+            os.unlink(audio2)
+
+    assert tid2 == "fallback-order-id", (
+        f"降级重试后应拿到 orderId，实得 {tid2!r}"
+    )
+    assert len(captured2) == 2, f"应重试 1 次（共 2 次请求），实得 {len(captured2)}"
+    qs1 = parse_qs(urlparse(captured2[0]).query)
+    qs2 = parse_qs(urlparse(captured2[1]).query)
+    assert "roleType" in qs1, "第 1 次请求应带 roleType"
+    for k in ("roleType", "roleNum", "pd"):
+        assert k not in qs2, f"降级重试不该再带 {k}，实得 keys={sorted(qs2)}"
+    assert "appId" in qs2 and "fileSize" in qs2, "降级重试仍须带最小参数集"
+    print("OK 12b: 26600 拒绝增强参数 → 自动退回最小参数集重试 ✓")
+
+    # === Case C: 没开增强参数时不该带这些 key ===
+    audio3 = _make_test_audio(seconds=1)
+    captured3: list = []
+
+    class PlainSession:
+        def post(self, url, headers=None, data=None, timeout=None):
+            captured3.append(url)
+            return FakeResp(ok_payload)
+
+    xf._cached_session = PlainSession()
+    try:
+        xf._upload_audio(
+            audio3, app_id="a", secret_key="b", language="cn"
+        )
+    finally:
+        xf._release_cached_session()
+        if os.path.exists(audio3):
+            os.unlink(audio3)
+
+    qs3 = parse_qs(urlparse(captured3[0]).query)
+    for k in ("roleType", "roleNum", "pd", "eng_colloqproc"):
+        assert k not in qs3, f"没开增强时不该带 {k}，实得 keys={sorted(qs3)}"
+    print("OK 12c: 未开启增强 → URL 不含增强参数 ✓")
+
+    # === Case D: 降级码表包含 26600 和 26610 ===
+    assert "26600" in xf._DEGRADE_CODES and "26610" in xf._DEGRADE_CODES, (
+        f"降级码表应含 26600/26610，实得 {xf._DEGRADE_CODES}"
+    )
+    print("OK 12d: 降级码表 = {26600, 26610}")
+
+    print("OK 12: 增强参数上传契约 + 失败自动降级对\n")
+
+
 def _make_test_audio(seconds: int = 3) -> str:
     """生成一个测试用 wav（用 ffmpeg 合成静音）。失败时返回任意 wav。"""
     import subprocess
@@ -586,6 +846,8 @@ if __name__ == "__main__":
     test_upload_url_format()
     test_poll_result_status_codes()
     test_parse_result_content()
+    test_role_separation_and_timestamps()
+    test_enhanced_params_and_degrade()
     print("=" * 50)
     print("ALL xf_asr smoke tests passed ✓")
     print("=" * 50)

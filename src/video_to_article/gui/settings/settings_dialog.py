@@ -35,6 +35,7 @@ from ...cover import (
     pipeline_to_legacy_flags,
     resolve_cover_pipeline_from_config,
 )
+from ...media.xf_asr import PD_DOMAINS
 
 
 def _scroll_page(inner: QWidget) -> QScrollArea:
@@ -295,6 +296,55 @@ class SettingsDialog(QDialog):
         xform.addRow("语言", self.xf_language)
         xform.addRow(self.xf_mock)
         xform.addRow("轮询超时（秒）", self.xf_max_wait)
+
+        # === 2026-10-02 新增：转写增强 4 项（角色分离 / 领域 / 口语规整 / 时间戳）===
+        self.xf_role_separation = QCheckBox("分离说话人（标注【说话人1】…）")
+        self.xf_role_separation.setToolTip(
+            "开启后 upload 带 roleType=1 + roleNum=N，输出每段加【说话人N】标签。\n"
+            "适合两人对话（访谈 / 对话课 / 师生问答）。\n"
+            "⚠ 需账号开通「角色分离」能力，否则讯飞会拒绝该参数——\n"
+            "  本程序会自动退回基础参数重试，不会中断转写。\n"
+            "⚠ 官方注明该能力「目前还是测试效果达不到商用标准」。\n"
+            "  本地 Qwen3-ASR 不支持说话人分离，此开关只对讯飞生效。"
+        )
+        self.xf_role_separation.toggled.connect(self._on_xf_role_toggled)
+
+        self.xf_role_num = QSpinBox()
+        self.xf_role_num.setRange(0, 10)
+        self.xf_role_num.setValue(2)
+        self.xf_role_num.setToolTip(
+            "发音人个数。0 = 自动盲分（让讯飞自己判断人数）；1-10 = 指定人数。\n"
+            "两人对话填 2。建议填实际人数，多填会降低聚类准确率。"
+        )
+
+        self.xf_pd_domain = QComboBox()
+        for code, label in PD_DOMAINS.items():
+            self.xf_pd_domain.addItem(label, code)
+        self.xf_pd_domain.setToolTip(
+            "垂直领域个性化模型。edu=教育 对课堂实录的术语识别率提升最明显。\n"
+            "选「通用」则不传 pd 参数（讯飞默认模型）。"
+        )
+
+        self.xf_colloquial_proc = QCheckBox("口语规整（自动去「嗯/啊/呃」+ 口癖重复）")
+        self.xf_colloquial_proc.setChecked(True)
+        self.xf_colloquial_proc.setToolTip(
+            "开启后 upload 带 eng_colloqproc=true。\n"
+            "课堂实录/访谈口癖多，去掉后给下游 LLM 成稿的文本干净很多。\n"
+            "零成本、零权限，建议常开。"
+        )
+
+        self.xf_timestamps = QCheckBox("输出时间戳（每段加 [MM:SS] 前缀）")
+        self.xf_timestamps.setChecked(True)
+        self.xf_timestamps.setToolTip(
+            "开启后每段前面加 [MM:SS] 时间戳（读的是 st.bg / lattice2.begin，\n"
+            "本来就在响应里，只是之前没解析）。做文章时定位段落很方便。"
+        )
+
+        xform.addRow(self.xf_role_separation)
+        xform.addRow("发音人数", self.xf_role_num)
+        xform.addRow("垂直领域", self.xf_pd_domain)
+        xform.addRow(self.xf_colloquial_proc)
+        xform.addRow(self.xf_timestamps)
         outer.addWidget(xf_box)
 
         # 讯飞听见说明（mock 与隐私）
@@ -304,13 +354,25 @@ class SettingsDialog(QDialog):
             "  · 关闭 Mock + 填全 APPID + SecretKey → 调真实 API（数据传到讯飞云端，注意隐私）\n"
             "  · 长语音鉴权只需 APPID + SecretKey 两件套（APIKey 是短音频 ifasr 字段，长语音不用）\n"
             "  · 凭证缺失时会自动降级 Mock + WARNING（不报错）\n"
-            "  · 长音频（> 7.5 分钟）自动切 5 分钟一段，逐段上传 + 拼接\n"
+            "  · 长音频不切段，整段直传（讯飞 server 自己处理 ≤500MB / 5h）\n"
             "  · 注册地址：https://www.xfyun.cn/ → 控制台 → 语音转写（长语音）→ 创建应用\n"
             "  · 免费 5 小时试用包，足够跑通流程；超出按讯飞官方价目计费"
         )
         xf_tip.setWordWrap(True)
         xf_tip.setStyleSheet("color: #666; font-size: 11px;")
         outer.addWidget(xf_tip)
+
+        # 2026-10-02：说话人分离 / 领域优化的账号权限提示
+        xf_enh_tip = QLabel(
+            "🎙 转写增强（讯飞云端能力，与本地模型算力无关）：\n"
+            "  · 说话人分离需账号开通「角色分离」权限；未开通时程序自动退回基础参数重试\n"
+            "  · 官方注明该能力「目前还是测试效果达不到商用标准」，远场课堂录音效果会打折\n"
+            "  · Qwen3-ASR 本地模型**不支持**说话人分离（只输出连续文本），此开关仅对讯飞生效\n"
+            "  · 真正要在本地分离，需换 FunASR + CAM++（spk_model=\"cam++\"，多占显存），本程序暂未接"
+        )
+        xf_enh_tip.setWordWrap(True)
+        xf_enh_tip.setStyleSheet("color: #666; font-size: 11px;")
+        outer.addWidget(xf_enh_tip)
 
         # 2026-09-09: 中英混合等组合语言值的 API 限制说明（不暴露误导项）
         # qwen_asr 0.0.6 validate_language 只接受 30 种单语种；Chinese 跑混合足够
@@ -379,6 +441,13 @@ class SettingsDialog(QDialog):
                 "检测到 xf_asr 引擎 + 凭证齐全，自动取消 Mock 模式（避免误调 mock）。\n"
                 "如确实要本地调试，可重新勾选。",
             )
+
+    def _on_xf_role_toggled(self, checked: bool) -> None:
+        """2026-10-02：说话人分离开关 → 「发音人数」随之 enable/disable。
+
+        关掉分离时人数没有意义，置灰避免用户以为填了会生效。
+        """
+        self.xf_role_num.setEnabled(bool(checked))
 
     def _pick_qwen_context(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -631,6 +700,19 @@ class SettingsDialog(QDialog):
         except (TypeError, ValueError):
             self.xf_max_wait.setValue(600)
 
+        # 2026-10-02：转写增强 5 项（先设 enable 状态，再设值，避免 toggle 抢跑）
+        self.xf_role_num.setEnabled(bool(xa.get("role_separation", False)))
+        self.xf_role_separation.setChecked(bool(xa.get("role_separation", False)))
+        try:
+            self.xf_role_num.setValue(int(xa.get("role_num", 2)))
+        except (TypeError, ValueError):
+            self.xf_role_num.setValue(2)
+        pd_code = str(xa.get("pd_domain") or "")
+        pd_idx = self.xf_pd_domain.findData(pd_code)
+        self.xf_pd_domain.setCurrentIndex(pd_idx if pd_idx >= 0 else 0)
+        self.xf_colloquial_proc.setChecked(bool(xa.get("colloquial_proc", True)))
+        self.xf_timestamps.setChecked(bool(xa.get("timestamps", True)))
+
         yt = self._config.get("youtube") or {}
         browser = str(yt.get("cookies_from_browser") or "")
         idx = self.yt_browser.findData(browser)
@@ -731,6 +813,12 @@ class SettingsDialog(QDialog):
                     "language": self.xf_language.currentData() or "cn",
                     "mock": self.xf_mock.isChecked(),
                     "max_wait_seconds": self.xf_max_wait.value(),
+                    # 2026-10-02 新增：转写增强
+                    "role_separation": self.xf_role_separation.isChecked(),
+                    "role_num": self.xf_role_num.value(),
+                    "pd_domain": self.xf_pd_domain.currentData() or "",
+                    "colloquial_proc": self.xf_colloquial_proc.isChecked(),
+                    "timestamps": self.xf_timestamps.isChecked(),
                 },
             },
             "youtube": {

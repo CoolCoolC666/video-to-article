@@ -230,6 +230,77 @@ def test_get_video_url():
     print("OK 8: get_bilibili_video_url 规范化（av 号也能拼出可用 URL）\n")
 
 
+def test_bv_case_normalize():
+    """9. BV 大小写：只归一化前缀，主体必须保持原样（2026-10-03 用户实测带出）。
+
+    用户粘的「稍后再看」URL 里 BV 号在查询串上，query 参数常被各种工具转成小写。
+    B 站 BV 号前缀固定大写 BV1，但**主体是 base58、区分大小写**——
+    BV1FpLU62EZW 和 BV1FPLU62EZW 是两个不同的视频，整体 upper() 会静默拉错片。
+    """
+    from video_to_article.providers.bilibili import normalize_bvid
+
+    # 前缀四种大小写组合都要归一化
+    for raw in ("bv1FpLU62EZW", "bV1FpLU62EZW", "Bv1FpLU62EZW", "BV1FpLU62EZW"):
+        assert resolve_bilibili_bvid(raw) == "BV1FpLU62EZW", (
+            f"前缀大小写归一失败: {raw!r} -> {resolve_bilibili_bvid(raw)!r}"
+        )
+    assert normalize_bvid("bv1FpLU62EZW") == "BV1FpLU62EZW"
+
+    # 关键：主体不能被转大写
+    assert resolve_bilibili_bvid("BV1FpLU62EZW") == "BV1FpLU62EZW", "主体被 upper 了"
+    assert resolve_bilibili_bvid("BV1FpLU62EZW") != "BV1FPLU62EZW", (
+        "整体 upper 会得到另一个视频的号，绝对不能这么做"
+    )
+
+    # 稍后再看 URL（原样，含 spm_id_from / vd_source 一堆噪音参数）
+    watchlater = (
+        "https://www.bilibili.com/list/watchlater?oid=117360182826804"
+        "&bvid=BV1a7YF6qEW2&spm_id_from=333.788"
+        ".top_right_bar_window_view_later.content.click"
+        "&vd_source=013004b341810962cceab210bf4343b7"
+    )
+    assert resolve_bilibili_bvid(watchlater) == "BV1a7YF6qEW2", (
+        "稍后再看 URL 里的 BV（在查询串上）应能取出"
+    )
+    # 前缀小写版也要能取出并归一
+    assert resolve_bilibili_bvid(watchlater.replace("BV1a7YF6qEW2", "bv1a7YF6qEW2")) == (
+        "BV1a7YF6qEW2"
+    )
+    print("OK 9: BV 大小写（只归一化前缀，主体保持原写 + 稍后再看 URL）\n")
+
+
+def test_url_shapes():
+    """10. 常见 B 站 URL 形态都要能识别（防「无法识别」）。"""
+    ok_cases = [
+        ("https://www.bilibili.com/video/BV1FpLU62EZW", "BV1FpLU62EZW"),
+        ("https://www.bilibili.com/video/BV1FpLU62EZW/?p=2&vd_source=abc", "BV1FpLU62EZW"),
+        ("https://m.bilibili.com/video/BV1FpLU62EZW", "BV1FpLU62EZW"),
+        ("//www.bilibili.com/video/BV1FpLU62EZW", "BV1FpLU62EZW"),
+        ("www.bilibili.com/video/BV1FpLU62EZW", "BV1FpLU62EZW"),
+        ("https://www.bilibili.com/video/BV1FpLU62EZW/", "BV1FpLU62EZW"),
+        ("https://www.bilibili.com/video/av170001?p=1", "BV17x411w7KC"),
+        # 分享文案：标题 + 链接 + 引导语混在一段
+        ("【这个视频超好看】https://www.bilibili.com/video/BV1FpLU62EZW 记得三连", "BV1FpLU62EZW"),
+        # HTML 片段
+        ('<a href="https://www.bilibili.com/video/BV1FpLU62EZW">点我</a>', "BV1FpLU62EZW"),
+        ("BV1FpLU62EZW", "BV1FpLU62EZW"),
+        ("av170001", "BV17x411w7KC"),
+    ]
+    for text, want in ok_cases:
+        got = resolve_bilibili_bvid(text)
+        assert got == want, f"{text[:56]!r} -> {got!r}，期望 {want}"
+
+    # 非视频类 URL 不该被误认（宁可空串也别给个错的）
+    for text in (
+        "https://space.bilibili.com/117360182826804",   # UP 主空间（不是单个视频）
+        "https://www.bilibili.com/bangumi/play/ep123456/",  # 番剧单集（另一类内容）
+        "https://www.bilibili.com/list/watchlater?oid=117360182826804",  # 列表页无 bvid
+        "完全无关的一段文字",
+    ):
+        assert resolve_bilibili_bvid(text) == "", f"不该识别为视频: {text!r}"
+    print(f"OK 10: {len(ok_cases)} 种 URL 形态全识别 + 4 类非视频 URL 不误认\n")
+
+
 def main():
     test_extract_bvid_strict()
     test_extract_aid_strict()
@@ -239,6 +310,8 @@ def main():
     test_resolve_bvid()
     test_resolve_shortlink()
     test_get_video_url()
+    test_bv_case_normalize()
+    test_url_shapes()
     print("=" * 50)
     print("ALL bilibili-parse smoke tests passed ✓")
     print("=" * 50)

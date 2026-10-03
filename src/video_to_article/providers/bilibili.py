@@ -72,19 +72,54 @@ def clean_bilibili_title(title: str) -> str:
     return re.sub(r"\s+", " ", text).strip() or "未知标题"
 
 
+def normalize_bvid(bvid: str) -> str:
+    """归一化 BV 号的**前缀**，主体保持原样。
+
+    2026-10-03：用户实测把稍后再看 URL 粘进来时发现的大小写问题。
+
+    ⚠ **只归一化前缀，绝对不能把整个号转大写**——base58 字母表
+    （fZodR9XQDSUm21yCkr6zBqiveYah8bt4xsWpHnJE7jL5VG3guMTKNPAwcF）
+    本身大小写混排，BV1FpLU62EZW 和 BV1FPLU62EZW 是**两个不同的视频**。
+    整体 upper() 会静默拉到别的视频。
+
+    归一化内容：
+        "bv1FpLU62EZW" -> "BV1FpLU62EZW"   前缀小写 → 合法
+        "BV1FpLU62EZW"  -> "BV1FpLU62EZW"   已是规范
+        "bv1fplu62ezw"  -> "BV1fplu62ezw"   前缀修了，主体仍按原样校验
+
+    Returns:
+        归一化后的字符串；不是 BV 形状时原样返回
+    """
+    s = (bvid or "").strip()
+    if len(s) >= 3 and s[:2].upper() == "BV" and s[2] == "1":
+        return "BV1" + s[3:]
+    return s
+
+
+def is_valid_bvid(bvid: str) -> bool:
+    """BV 号是否合法：12 位 + "BV1" 前缀 + 9 位合法 base58 字符（区分大小写）。"""
+    s = normalize_bvid(bvid)
+    if len(s) != 12 or not s.startswith("BV1"):
+        return False
+    return all(ch in _BV_TR for ch in s[3:])
+
+
 def extract_bvid(url_or_id: str) -> str:
-    """从 URL / 裸 BV 号里提取 BV 号（严格语法）。
+    """从 URL / 裸 BV 号里提取 BV 号（严格语法 + 前缀归一化）。
 
     2026-10-03 重写。之前是 `re.search(r"(BV[\\w]+)")`，会把 "BV1garbage!!!" 这类
     也当 BV 号返回，下游拿它拼 API 必然 404。
 
     真实 BV 号 = "BV1" + 9 位 base58（字母表去掉 1 / i / l / o 四个易混字符）。
     长度固定 12 位，用 \\b 边界避免从更长的串里截一段。
+
+    匹配用 IGNORECASE（用户手打可能写成 bv1…），但**返回前会归一化前缀**——
+    主体字符保持原样，因为 base58 区分大小写。
     """
     if not url_or_id:
         return ""
     match = RE_BV.search(str(url_or_id))
-    return match.group(0) if match else ""
+    return normalize_bvid(match.group(0)) if match else ""
 
 
 def extract_aid(url_or_id: str) -> str:
@@ -153,15 +188,6 @@ def bvid_to_aid(bvid: str) -> str:
     return str((r - _BV_ADD) ^ _BV_XOR)
 
 
-def is_valid_bvid(bvid: str) -> bool:
-    """BV 号是否合法：12 位 + "BV1" 前缀 + 9 位合法 base58 字符。"""
-    if not bvid or len(bvid) != 12:
-        return False
-    if not bvid.startswith("BV1"):
-        return False
-    return all(ch in _BV_TR for ch in bvid[3:])
-
-
 @dataclass
 class BilibiliRef:
     """从自由文本里解析出的一条 B 站引用。"""
@@ -221,7 +247,7 @@ def parse_bilibili_refs(text: str, *, allow_bare_numbers: bool = False) -> List[
         else:  # /video/BV1xxx
             tail = raw.split("/video/")[-1].split("?")[0].split("/")[0]
             if is_valid_bvid(tail):
-                _take(m, BilibiliRef("bv", tail, raw))
+                _take(m, BilibiliRef("bv", normalize_bvid(tail), raw))
     # 2) b23.tv 短链（要联网才能展开，先原样返回）
     for m in RE_SHORT_URL.finditer(text):
         if _free(m.span()):
@@ -229,7 +255,7 @@ def parse_bilibili_refs(text: str, *, allow_bare_numbers: bool = False) -> List[
     # 3) 显式 BV
     for m in RE_BV.finditer(text):
         if _free(m.span()):
-            _take(m, BilibiliRef("bv", m.group(0), m.group(0)))
+            _take(m, BilibiliRef("bv", normalize_bvid(m.group(0)), m.group(0)))
     # 4) 显式 av 前缀
     for m in RE_AV_PREFIXED.finditer(text):
         if _free(m.span()):
@@ -301,9 +327,10 @@ def resolve_bilibili_bvid(
         return ""
     text = str(ref).strip()
 
-    # 1) 直接就是合法 BV
+    # 1) 直接就是合法 BV（注意返回**归一化后**的，不能返回原串——
+    #    用户手打 "bv1FpLU62EZW" 时小写前缀会让 B 站 API 查不到）
     if is_valid_bvid(text):
-        return text
+        return normalize_bvid(text)
 
     # 2) 文本里可能有多个引用——取第一个能解析成 bvid 的
     for r in parse_bilibili_refs(text):

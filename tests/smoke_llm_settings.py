@@ -647,6 +647,86 @@ def test_cover_and_host_profiles():
     print("OK 11: AI 封面 / 图床 档案区（四处并存 · Key 不坏 · 互不干扰）\n")
 
 
+def test_engine_focus_ui():
+    """12. 转写 Tab 按所选引擎聚焦 + 「显示全部」开关（2026-10-04 用户要求）。
+
+    用户反馈「ASR 引擎界面太长」——原来 5 个引擎的设置全铺开，页面要滚很久。
+    现在默认只显示所选引擎那一个分组，勾「显示全部引擎的设置」可恢复原样。
+
+    ⚠ 关键约束：**隐藏只是 setVisible(False)，参数照常读写**。
+       隐藏一个引擎的配置不等于删掉它，切回来时值还在。
+    """
+    from PySide6.QtWidgets import QApplication
+
+    from video_to_article import config as cfg_mod
+    from video_to_article.gui.settings import settings_dialog as sd_mod
+    from video_to_article.gui.settings.settings_dialog import SettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    cfg = {
+        "llm": json.loads(json.dumps(REAL_OLD_CONFIG)),
+        "transcribe": {"asr_engine": "xf_asr", "custom_post": {
+            "endpoint": "https://api.minimax.cn/v1/speech_to_text",
+            "api_key": "sk-cp-123456", "language": "zh", "mock": False,
+        }},
+    }
+    cfg_mod.load_config = lambda: json.loads(json.dumps(cfg))
+    sd_mod.load_config = lambda: json.loads(json.dumps(cfg))
+
+    d = SettingsDialog()
+    engines = ("funasr", "qwen_asr", "xf_asr", "custom_post")
+
+    # ⚠ 必须用 isHidden() 而不是 isVisible()：Tab 本身不可见时 isVisible() 恒为 False
+    def shown(engine):
+        return not d._engine_blocks[engine][0].isHidden()
+
+    # --- 默认只显示 config 里选的引擎 ---
+    assert d.tr_show_all.isChecked() is False, "默认应是聚焦模式"
+    assert shown("xf_asr") is True, "config 选了 xf_asr，该组应显示"
+    for e in ("funasr", "qwen_asr", "custom_post"):
+        assert shown(e) is False, f"{e} 不该显示"
+
+    # --- 切引擎跟着切换 ---
+    for e in engines:
+        d.tr_engine.setCurrentIndex(d.tr_engine.findData(e))
+        visible = [k for k in engines if shown(k)]
+        assert visible == [e], f"选 {e} 时应只显示它，实得 {visible}"
+
+    # --- 勾「显示全部」→ 四个都显示；取消 → 只剩当前引擎 ---
+    d.tr_show_all.setChecked(True)
+    assert all(shown(e) for e in engines), "勾了显示全部还藏着"
+    d.tr_show_all.setChecked(False)
+    cur = d.tr_engine.currentData()
+    for e in engines:
+        assert shown(e) == (e == cur), f"聚焦模式下 {e} 显隐不对"
+
+    # --- 隐藏分组的参数照常保存（不会丢配置）---
+    d.tr_engine.setCurrentIndex(d.tr_engine.findData("xf_asr"))
+    d.xf_app_id.setText("xf-app-id")
+    d.xf_pd_domain.setCurrentIndex(d.xf_pd_domain.findData("edu"))
+    d.cp_endpoint.setText("https://hidden-but-saved/stt")
+    up = d._collect_updates()["transcribe"]
+    assert up["xf_asr"]["app_id"] == "xf-app-id"
+    assert up["xf_asr"]["pd_domain"] == "edu"
+    assert up["custom_post"]["endpoint"] == "https://hidden-but-saved/stt", (
+        "隐藏的 custom_post 分组参数丢了 —— 聚焦必须是「不显示」而非「不保存」"
+    )
+
+    # --- 旧引擎名 minimax_asr 也要对上 custom_post 分组 ---
+    cfg2 = json.loads(json.dumps(cfg))
+    cfg2["transcribe"]["asr_engine"] = "minimax_asr"
+    cfg_mod.load_config = lambda: json.loads(json.dumps(cfg2))
+    sd_mod.load_config = lambda: json.loads(json.dumps(cfg2))
+    d2 = SettingsDialog()
+    assert d2.tr_engine.currentData() == "custom_post", (
+        "旧名 minimax_asr 没归一到 custom_post（会静默回落到 funasr）"
+    )
+    assert not d2._engine_blocks["custom_post"][0].isHidden(), (
+        "旧名应显示 custom_post 分组"
+    )
+    print("OK 12: 转写 Tab 引擎聚焦（默认只看当前 / 显示全部开关 / 隐藏不丢参数 / 旧名归一）\n")
+
+
 def main():
     test_resolve_protocol_compat()
     test_vendor()
@@ -659,6 +739,7 @@ def main():
     test_custom_post_profiles()
     test_asr_engine_list_shared()
     test_cover_and_host_profiles()
+    test_engine_focus_ui()
     print("=" * 50)
     print("ALL llm-settings smoke tests passed ✓")
     print("=" * 50)

@@ -236,6 +236,9 @@ class SettingsDialog(ProfileMixin, QDialog):
         root.addWidget(buttons)
 
         self.load_from_disk()
+        # 2026-10-04：load_from_disk 之后要重跑一次显隐同步——
+        # 建 Tab 时引擎还是默认值，config 里的实际引擎是这时才读进来的
+        self._sync_engine_visibility()
 
     def _on_llm_vendor_changed(self) -> None:
         """切厂商时预填推荐 Base URL（可手改，不强制）。
@@ -422,6 +425,25 @@ class SettingsDialog(ProfileMixin, QDialog):
             return
         self._profile_manage(self.PROFILES[pairs.index(choice)])
 
+    def _eng_block(self, engine: str, *widgets: QWidget) -> None:
+        """登记「这个 widget 属于哪个引擎」，供 _sync_engine_visibility 显隐用。"""
+        self._engine_blocks.setdefault(engine, []).extend(widgets)
+
+    def _sync_engine_visibility(self) -> None:
+        """只显示当前引擎的设置分组，除非勾了「显示全部」。
+
+        2026-10-04：转写 Tab 原本把 5 个引擎的设置全铺开，页面长到要滚很久。
+        现在默认只显示所选引擎那一个；勾「显示全部引擎的设置」恢复原样。
+
+        ⚠ 隐藏只是 setVisible(False)，**参数照常读写**——不会丢配置。
+        """
+        show_all = self.tr_show_all.isChecked()
+        current = normalize_engine(self.tr_engine.currentData() or "funasr")
+        for engine, widgets in self._engine_blocks.items():
+            visible = show_all or (engine == current)
+            for w in widgets:
+                w.setVisible(visible)
+
     def _on_cover_enable_toggled(self, checked: bool) -> None:
         if self._cover_pipeline_syncing:
             return
@@ -591,6 +613,18 @@ class SettingsDialog(ProfileMixin, QDialog):
         form.addRow("CPU 线程", self.tr_threads)
         form.addRow("FunASR 模型目录（funasr 引擎专用）", self.tr_funasr_dir)
         form.addRow(self.tr_auto)
+        # 2026-10-04：默认「只看当前引擎」，下面只显示所选引擎的设置分组。
+        # 用户要回到原来那种全量表单时勾这个。
+        self.tr_show_all = QCheckBox("显示全部引擎的设置（不分当前引擎）")
+        self.tr_show_all.setChecked(False)
+        self.tr_show_all.setToolTip(
+            "默认只显示「默认 ASR 引擎」所选的那一个引擎的设置，转写页因此短很多。\n\n"
+            "勾选后恢复成显示全部引擎的完整表单（调试 / 一次性批量改参数时用）。\n"
+            "⚠ 隐藏的分组**参数仍会照常保存**，只是不显示——不会丢配置。"
+        )
+        form.addRow(self.tr_show_all)
+        # 引擎与引擎专属分组的映射（见 _sync_engine_visibility）
+        self._engine_blocks = {}
         outer.addWidget(base)
 
         # === 2026-10-02 新增：FunASR 高级（本地说话人分离）===
@@ -640,6 +674,7 @@ class SettingsDialog(ProfileMixin, QDialog):
         fs_tip.setWordWrap(True)
         fs_tip.setStyleSheet("color: #666; font-size: 11px;")
         outer.addWidget(fs_tip)
+        self._eng_block("funasr", fs_box, fs_tip)
 
         # Qwen3-ASR 高级
         qwen_box = QGroupBox("Qwen3-ASR 高级（qwen_asr 引擎专用）")
@@ -715,6 +750,7 @@ class SettingsDialog(ProfileMixin, QDialog):
         qform.addRow("语言", self.qwen_language)
         qform.addRow("Device（GPU / CPU fallback）", self.qwen_device)
         outer.addWidget(qwen_box)
+        self._eng_block("qwen_asr", qwen_box)
 
         # 2026-09-27 新增：讯飞听见（xf_asr 引擎专用）
         # 2026-09-27 订正：长语音鉴权只用 APPID + SecretKey 两件，删 API Key 字段 → 5 字段
@@ -833,6 +869,7 @@ class SettingsDialog(ProfileMixin, QDialog):
         xf_enh_tip.setWordWrap(True)
         xf_enh_tip.setStyleSheet("color: #666; font-size: 11px;")
         outer.addWidget(xf_enh_tip)
+        self._eng_block("xf_asr", xf_box, xf_tip, xf_enh_tip)
 
         # === 2026-10-02 新增：自定义 POST（端点 + 请求头都可配）===
         mm_box = QGroupBox("自定义（POST）高级 — custom_post 引擎专用")
@@ -922,7 +959,8 @@ class SettingsDialog(ProfileMixin, QDialog):
         outer.addWidget(mm_box)
 
         # === 2026-10-04：自定义 POST 配置档案（机制在 profile_store）===
-        outer.addWidget(self._build_profile_box(self._spec("cp")))
+        cp_prof_box = self._build_profile_box(self._spec("cp"))
+        outer.addWidget(cp_prof_box)
 
         mm_tip = QLabel(
             "💡 自定义 POST 云端 ASR（默认按 MiniMax asr-1.0 契约实现）：\n"
@@ -941,6 +979,7 @@ class SettingsDialog(ProfileMixin, QDialog):
         mm_tip.setWordWrap(True)
         mm_tip.setStyleSheet("color: #666; font-size: 11px;")
         outer.addWidget(mm_tip)
+        self._eng_block("custom_post", mm_box, cp_prof_box, mm_tip)
 
         # 2026-09-09: 中英混合等组合语言值的 API 限制说明（不暴露误导项）
         # qwen_asr 0.0.6 validate_language 只接受 30 种单语种；Chinese 跑混合足够
@@ -983,6 +1022,11 @@ class SettingsDialog(ProfileMixin, QDialog):
 
         outer.addStretch(1)
         self.tabs.addTab(_scroll_page(page), "转写")
+
+        # 2026-10-04：按所选引擎显示对应设置分组（默认行为）
+        self.tr_engine.currentIndexChanged.connect(self._sync_engine_visibility)
+        self.tr_show_all.toggled.connect(self._sync_engine_visibility)
+        self._sync_engine_visibility()
 
     def _on_tr_engine_changed(self, _index: int) -> None:
         """2026-09-27 防呆：切到云端引擎时自动同步 Mock 状态。
@@ -1124,6 +1168,9 @@ class SettingsDialog(ProfileMixin, QDialog):
         page = QWidget()
         layout = QVBoxLayout(page)
 
+        # 2026-10-04：档案区放最上面——切服务是最高频动作，不必滚到底部
+        layout.addWidget(self._build_profile_box(self._spec("cover")))
+
         base = QGroupBox("基础开关与服务")
         form = QFormLayout(base)
         # 互斥：启用 AI 封面（提示词+API） / 仅导出提示词；都不勾=关闭
@@ -1241,13 +1288,13 @@ class SettingsDialog(ProfileMixin, QDialog):
         layout.addWidget(pre)
         self.cover_pre_box = pre
         layout.addStretch(1)
-        # === 2026-10-04：AI 封面配置档案 ===
-        layout.addWidget(self._build_profile_box(self._spec("cover")))
         self.tabs.addTab(_scroll_page(page), "AI 封面")
 
     def _build_host_tab(self) -> None:
         page = QWidget()
         form = QFormLayout(page)
+        # 2026-10-04：档案区放最上面（切图床是高频动作）
+        form.addRow(self._build_profile_box(self._spec("host")))
         self.host_enable = QCheckBox("启用图床上传")
         self.host_provider = QLineEdit()
         self.host_api_url = QLineEdit()
@@ -1270,8 +1317,6 @@ class SettingsDialog(ProfileMixin, QDialog):
         form.addRow("url_json_path", self.host_url_path)
         form.addRow("timeout_seconds", self.host_timeout)
         form.addRow("extra_fields (JSON)", self.host_extra)
-# === 2026-10-04：图床配置档案 ===
-        form.addRow(self._build_profile_box(self._spec("host")))
         self.tabs.addTab(_scroll_page(page), "图床")
 
     def load_from_disk(self) -> None:
@@ -1294,7 +1339,11 @@ class SettingsDialog(ProfileMixin, QDialog):
         self.llm_retries.setValue(int(llm.get("max_retries") or 3))
 
         tr = self._config.get("transcribe") or {}
-        idx = self.tr_engine.findData(str(tr.get("asr_engine") or "funasr"))
+        # ⚠ 必须 normalize_engine：config 里可能还留着旧名 "minimax_asr"，
+        #   直接 findData 找不到就静默回落到默认 funasr（用户以为改了引擎其实没改）。
+        idx = self.tr_engine.findData(
+            normalize_engine(tr.get("asr_engine") or "funasr")
+        )
         self.tr_engine.setCurrentIndex(idx if idx >= 0 else 0)
         self.tr_funasr.setText(str(tr.get("funasr_model") or "sensevoice"))
         sidx = self.tr_model_size.findData(str(tr.get("model_size") or "tiny"))

@@ -834,6 +834,35 @@ def upload_audio_for_public_url(audio_path: Path, image_host_config: dict) -> st
     return url
 
 
+def _dashscope_poll_headers(
+    api_key: str, extra: Optional[Dict[str, str]] = None
+) -> Dict[str, str]:
+    """轮询专用的请求头 —— **不能带 X-DashScope-Async**。
+
+    官方文档轮询示例只有两个头：
+        curl -X GET '.../api/v1/tasks/{task_id}' \\
+          -H "Authorization: Bearer $KEY" \\
+          -H "Content-Type: application/json"
+
+    ⚠ 实测（2026-10-04，同一 task_id A/B 对照）：
+        带 X-DashScope-Async: enable  → 403
+                                     current user api does not support
+                                     asynchronous calls
+        只带 Authorization+Content-Type → 200，拿到 task_status
+    提交接口要 `enable`，轮询接口带了就 403 —— 两者不能共用一个 header 函数。
+    这句报错和「模型名填成同步模型」时的报错**完全一样**，极易误判：
+    任务明明已经提交成功（拿到了 task_id），却在轮询这一步被拒。
+    """
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    for k, v in (extra or {}).items():
+        if v and k.lower() != "x-dashscope-async":
+            headers[k] = v
+    return headers
+
+
 def _dashscope_headers(api_key: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     headers = {"Authorization": f"Bearer {api_key}", "X-DashScope-Async": "enable"}
     for k, v in (extra or {}).items():
@@ -954,7 +983,18 @@ def _dashscope_submit(
     _reject_sync_only_model(model)
     # 官方明确警告：URL 含空格/中文必须先 percent-encode，
     # 否则报 InvalidFile.DownloadFailed。用户的课件文件名几乎都是中文。
-    safe_url = urllib.parse.quote(audio_url, safe=":/?#[]@!$&'()*+,;=")
+    #
+    # ⚠⚠ `%` **必须**在 safe 里：URL 可能带 S3/R2 的 presigned 签名，
+    #   里面 X-Amz-Credential 的值含 `AKID%2F2026...%2Faws4_request`。
+    #   若 `%` 不 safe，quote 会把 `%2F` 二次编码成 `%252F`，
+    #   R2/S3 收到后解码一次只剩 `AKID%2F...`，再解析 scope 时
+    #   「slash-separated parts」= 1，签名直接失效：
+    #     InvalidArgument: Credential sigv4 header should have at least
+    #     5 slash-separated parts, not 1
+    #   实测：同一个 key，原始 presigned URL 能下（200/5.2MB），
+    #   经二次编码后 400，且表现为任务 FILE_DOWNLOAD_FAILED。
+    #   `%` 放进 safe 不影响中文/空格的编码（它们本来就不在 safe 里）。
+    safe_url = urllib.parse.quote(audio_url, safe=":%/?#[]@!$&'()*+,;=")
 
     params: Dict[str, object] = {"channel_id": [0]}
     if language and "paraformer" in str(model).lower():
@@ -990,6 +1030,34 @@ def _dashscope_submit(
     return task_id
 
 
+def _raise_dashscope_poll_error(resp, url: str, task_id: str) -> None:
+    """轮询失败时抛错。任务**已提交成功**，别再把锅甩给模型名。
+
+    ⚠ 实测（2026-10-04）：带 `X-DashScope-Async: enable` 轮询同一个
+    已成功提交的 task_id → 403 current user api does not support
+    asynchronous calls；去掉该头 → 200 正常返回 task_status。
+    也就是说这句报错在**轮询**阶段出现时，含义与**提交**阶段完全不同，
+    后者才是「模型名填成同步模型」。不说清的话，用户会去反复改模型名。
+    """
+    base = _extract_error(resp, url)
+    try:
+        blob = json.dumps(resp.json(), ensure_ascii=False).lower()
+    except Exception:
+        blob = (resp.text or "").lower()
+    if "asynchronous" in blob or "异步" in blob:
+        raise RuntimeError(
+            base
+            + "\n\n⚠ 注意：任务**已经提交成功**（task_id="
+            + task_id
+            + "），这一步是**轮询**被拒，不是模型名的问题。\n"
+              "  官方文档的轮询接口只要求两个头（Authorization + Content-Type），\n"
+              "  **不能带** X-DashScope-Async —— 带了就会得到这句 403。\n"
+              "  （这与提交阶段的同名报错是两回事：提交阶段才是模型名填成同步模型。）\n"
+              "  如果你是手动调这个接口，去掉 X-DashScope-Async 头即可。"
+        )
+    raise RuntimeError(base)
+
+
 def _dashscope_poll(
     base_url: str,
     api_key: str,
@@ -1006,10 +1074,10 @@ def _dashscope_poll(
     while time.time() < deadline:
         attempt += 1
         resp = session.get(
-            url, headers=_dashscope_headers(api_key, extra_headers), timeout=30
+            url, headers=_dashscope_poll_headers(api_key, extra_headers), timeout=30
         )
         if resp.status_code != 200:
-            raise RuntimeError(_extract_error(resp, url))
+            _raise_dashscope_poll_error(resp, url, task_id)
         payload = resp.json() or {}
         out = payload.get("output") or {}
         status = str(out.get("task_status") or "").upper()

@@ -210,8 +210,12 @@ def test_poll():
         done()
     assert link == "https://dashscope.oss/r.json", link
     assert s.gets[0]["url"] == f"{BASE}/tasks/t1", s.gets[0]["url"]
-    assert s.gets[0]["headers"]["X-DashScope-Async"] == "enable"
-    print("OK 3a: 轮询用 GET + 拿 transcription_url")
+    # 2026-10-04 订正：轮询接口**不能**带 X-DashScope-Async（带了 403）。
+    # 这条断言原来写的是 == "enable"，锁定的正是我当时的错误假设 ——
+    # 错误假设会顺着「实现 → 测试」固化下来，见 12c。
+    assert "X-DashScope-Async" not in s.gets[0]["headers"], s.gets[0]["headers"]
+    assert s.gets[0]["headers"]["Authorization"] == "Bearer K"
+    print("OK 3a: 轮询用 GET + 拿 transcription_url（且不带 async 标志）")
 
     # ⚠ 整体成功但子任务失败 —— 官方明确会这样，不查就会拿着不存在的 URL 去下载
     s = use(FakeSession(get_script=[
@@ -739,6 +743,77 @@ def test_dedicated_deployment_hint():
     print("OK 12b: 「不支持异步」提示以模型名为主因（附实测结论），部署形态作为次要可能")
 
 
+# ------- 12c: 轮询不能带 X-DashScope-Async（实测：带了 403，去掉 200）
+def test_poll_headers_exclude_async_flag():
+    """同一个 task_id A/B 对照（2026-10-04 实测）：
+
+      带 X-DashScope-Async: enable  → 403 ...does not support asynchronous calls
+      只带 Authorization+Content-Type → 200，正常返回 task_status
+
+    任务**已提交成功**却在轮询被拒，而这句报错和「模型名填成同步模型」
+    时一模一样 —— 极容易被误判成「又要去改模型名」。
+    """
+    from video_to_article.media.custom_post_asr import _dashscope_poll_headers
+
+    h = _dashscope_poll_headers("K", {"X-Custom": "v", "X-DashScope-Async": "enable",
+                                      "X-Empty": ""})
+    assert "X-DashScope-Async" not in h, f"轮询头绝不能含 async 标志: {sorted(h)}"
+    assert h["Authorization"] == "Bearer K"
+    assert h["Content-Type"] == "application/json", h
+    # 自定义头仍要带上（只是滤掉 async 标志与空值）
+    assert h["X-Custom"] == "v" and "X-Empty" not in h, h
+    # 提交用的头**仍必须**带 enable —— 两个函数不能混用
+    assert _dashscope_headers("K")["X-DashScope-Async"] == "enable"
+
+    # 轮询时确实用的是不带 async 的那套头
+    s = use(FakeSession(get_script=[
+        FakeResp(200, {"output": {"task_status": "SUCCEEDED",
+                                  "results": [{"subtask_status": "SUCCEEDED",
+                                               "transcription_url": "https://x/r.json"}]}}),
+    ]))
+    try:
+        _dashscope_poll(BASE, "K", "t1", 60)
+    finally:
+        done()
+    assert "X-DashScope-Async" not in s.gets[0]["headers"], (
+        f"轮询实际发出的头里不该有 async 标志: {sorted(s.gets[0]['headers'])}"
+    )
+    print("OK 12c: 轮询头不含 X-DashScope-Async（提交仍带）——两个接口头不可混用")
+
+
+# ------- 12d: presigned URL 的 % 不能被二次编码
+def test_presigned_url_not_double_encoded():
+    """R2/S3 presigned URL 里的 `X-Amz-Credential=AKID%2F2026...%2Faws4_request`
+    若被二次编码成 `%252F`，R2 解析 scope 时 slash-separated parts = 1：
+
+        InvalidArgument: Credential sigv4 header should have at least
+        5 slash-separated parts, not 1
+
+    实测：同一个 key，原始 URL 直连 200/5.2MB，经二次编码后 400，
+    任务表现为 FILE_DOWNLOAD_FAILED。'%' 必须在 safe 里。
+    """
+    import urllib.parse
+
+    raw = ("https://acct.r2.cloudflarestorage.com/bucket/asr/a.mp3"
+           "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+           "&X-Amz-Credential=AKID%2F20261004%2Fauto%2Fs3%2Faws4_request"
+           "&X-Amz-Signature=deadbeef%3D%3D")
+
+    # 模拟 _dashscope_submit 里的编码
+    encoded = urllib.parse.quote(raw, safe=":%/?#[]@!$&'()*+,;=")
+    assert "%252F" not in encoded, "签名 scope 的 %2F 不能被二次编码"
+    assert "%253D" not in encoded, "签名值里的 %3D 不能被二次编码"
+    # ⚠ 判据不是「unquote 回来 == 原串」（unquote 本就会把 %2F 还原成 /），
+    #   而是「已全是合法 URL 字符的 presigned URL **一个字节都不该变」。
+    assert encoded == raw, f"presigned URL 应原样透传:\n  {raw}\n  {encoded}"
+    # 但中文/空格**仍要**被编码（这是加 % 到 safe 的前提）
+    cn = "https://x.com/1-课件/a b.mp3"
+    enc_cn = urllib.parse.quote(cn, safe=":%/?#[]@!$&'()*+,;=")
+    assert "%E8%AF%BE%E4%BB%B6" in enc_cn, "中文仍须编码"
+    assert "%20" in enc_cn, "空格仍须编码"
+    print("OK 12d: presigned 签名的 % 不被二次编码，中文/空格仍正常编码")
+
+
 def main():
     test_endpoint_building()
     test_submit_body()
@@ -756,6 +831,8 @@ def main():
     test_credential_shape_warning()
     test_sync_only_model_rejected()
     test_dedicated_deployment_hint()
+    test_poll_headers_exclude_async_flag()
+    test_presigned_url_not_double_encoded()
     print()
     print("smoke_dashscope_asr: 全部通过 ✓")
 

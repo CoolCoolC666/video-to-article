@@ -313,14 +313,17 @@ def test_profile_manager_dialog():
     """8. ProfileManagerDialog：重命名 / 复制 / 删除 / 排序。"""
     from PySide6.QtWidgets import QApplication
 
-    from video_to_article.gui.settings.settings_dialog import ProfileManagerDialog
+    from video_to_article.gui.settings.settings_dialog import (
+        PROFILE_SPEC_LLM,
+        ProfileManagerDialog,
+    )
 
     app = QApplication.instance() or QApplication([])
     base = [
         {"id": "p1", "label": "主力", "api_key": "k1", "model": "M1"},
         {"id": "p2", "label": "备用", "api_key": "k2", "model": "M2"},
     ]
-    dlg = ProfileManagerDialog(None, base)
+    dlg = ProfileManagerDialog(None, base, PROFILE_SPEC_LLM, kind_label="大模型")
 
     def _sel(i):
         dlg.list_w.setCurrentRow(i)
@@ -379,6 +382,119 @@ def test_profile_manager_dialog():
     print("OK 8: ProfileManagerDialog（重命名/复制/删除/防删空/排序）\n")
 
 
+def test_custom_post_profiles():
+    """9. custom_post（自定义 POST ASR）也支持多档案。
+
+    2026-10-04 用户要求：切一个云端 Provider 要手打「端点 + Key + 请求头文件路径」
+    三件套，而不同 Provider 的鉴权方式还各不相同（Bearer / 自定义头 / 私有网关）。
+    所以每个档案可以指向**不同的请求头文件**——这正是这个功能的核心价值。
+    """
+    from PySide6.QtWidgets import QApplication
+
+    from video_to_article import config as cfg_mod
+    from video_to_article.gui.settings import settings_dialog as sd_mod
+    from video_to_article.gui.settings.settings_dialog import (
+        PROFILE_SPEC_ASR,
+        PROFILE_SPEC_LLM,
+        ProfileManagerDialog,
+        SettingsDialog,
+    )
+
+    app = QApplication.instance() or QApplication([])
+    cfg = {
+        "llm": json.loads(json.dumps(REAL_OLD_CONFIG)),
+        "transcribe": {
+            "asr_engine": "custom_post",
+            "custom_post": {
+                "endpoint": "https://api.minimax.cn/v1/speech_to_text",
+                "api_key": "sk-cp-key-123456",
+                "headers_file": "",
+                "language": "zh",
+                "mock": False,
+                "role_separation": True,
+                "timestamps": True,
+                "max_wait_seconds": 600,
+            },
+        },
+    }
+    cfg_mod.load_config = lambda: json.loads(json.dumps(cfg))
+    sd_mod.load_config = lambda: json.loads(json.dumps(cfg))
+
+    d = SettingsDialog()
+    # --- 旧配置（无档案）必须能加载 ---
+    assert d.cp_endpoint.text() == "https://api.minimax.cn/v1/speech_to_text"
+    assert d.cp_language.currentData() == "zh"
+    assert d.cp_role_separation.isChecked() is True
+    assert d.cp_max_wait.value() == 600
+    assert d._cp_get_profiles() == [], "没有档案时不该凭空造出来"
+
+    # --- 存两个档案，各自指向不同请求头文件 ---
+    d.cp_headers_file.setText("D:/hdr/minimax.txt")
+    d._cp_set_profiles([d._cp_build_profile("cp1", "MiniMax 官方")])
+    d.cp_headers_file.setText("D:/hdr/gateway.txt")
+    d.cp_endpoint.setText("https://gw.internal/stt")
+    d._cp_set_profiles(
+        d._cp_get_profiles() + [d._cp_build_profile("cp2", "私有网关")],
+        keep_active="cp2",
+    )
+    profs = d._cp_get_profiles()
+    assert len(profs) == 2, f"应存 2 个档案，实得 {len(profs)}"
+    assert profs[0]["headers_file"] == "D:/hdr/minimax.txt"
+    assert profs[1]["headers_file"] == "D:/hdr/gateway.txt", (
+        "不同档案应能指向不同请求头文件（不同 Provider 鉴权方式不同）"
+    )
+    assert profs[1]["endpoint"] == "https://gw.internal/stt"
+
+    # --- 应用档案应把 UI 切回对应配置 ---
+    d._cp_apply_profile_to_ui(profs[0])
+    assert d.cp_endpoint.text() == "https://api.minimax.cn/v1/speech_to_text"
+    assert d.cp_headers_file.text() == "D:/hdr/minimax.txt"
+    assert d.cp_api_key.text() == "sk-cp-key-123456"
+
+    # --- 写回：档案在、Key 未坏、类型是 list ---
+    up = d._collect_updates()
+    cp = up["transcribe"]["custom_post"]
+    llm = up["llm"]
+    assert isinstance(cp.get("profiles"), list), "profiles 必须是 list（否则删不掉）"
+    assert len(cp["profiles"]) == 2
+    assert cp["api_key"] == "sk-cp-key-123456", "custom_post 的 Key 不能被改坏"
+    assert llm["api_key"] == REAL_OLD_CONFIG["api_key"], "LLM 的 Key 不能被改坏"
+
+    # --- 两个引擎的档案互相独立，删一个不复活 ---
+    c2 = json.loads(json.dumps(cfg))
+    c2["transcribe"]["custom_post"]["profiles"] = [
+        {"id": "cp1", "label": "A"}, {"id": "cp2", "label": "B"},
+    ]
+    deep_update(c2, {"transcribe": {"custom_post": {
+        "profiles": [{"id": "cp1", "label": "A"}],
+    }}})
+    assert [p["id"] for p in c2["transcribe"]["custom_post"]["profiles"]] == ["cp1"]
+    # 只改别的字段，删掉的档案不该复活
+    deep_update(c2, {"transcribe": {"custom_post": {"max_wait_seconds": 999}}})
+    assert [p["id"] for p in c2["transcribe"]["custom_post"]["profiles"]] == ["cp1"]
+
+    # --- 共用弹窗按规格渲染，且 Key 不明文显示 ---
+    dlg = ProfileManagerDialog(
+        None, profs, PROFILE_SPEC_ASR, kind_label="自定义（POST）"
+    )
+    dlg._reload()
+    assert "自定义（POST）" in dlg.windowTitle()
+    row0 = dlg.list_w.item(0).text()
+    for expect in ("端点=", "Key=", "请求头文件="):
+        assert expect in row0, f"ASR 规格该显示 {expect}: {row0!r}"
+    assert "sk-cp-key-123456" not in row0, "Key 不能明文显示在列表里"
+
+    dlg2 = ProfileManagerDialog(
+        None, [{"id": "p1", "label": "X", "api_key": "k", "model": "M"}],
+        PROFILE_SPEC_LLM, kind_label="大模型",
+    )
+    dlg2._reload()
+    assert "大模型" in dlg2.windowTitle()
+    assert "模型=" in dlg2.list_w.item(0).text()
+    assert "端点=" not in dlg2.list_w.item(0).text(), "LLM 规格不该显示 ASR 字段"
+    print("OK 9: custom_post 多档案（独立请求头文件 / 互不干扰 / 共用弹窗）\n")
+
+
 def main():
     test_resolve_protocol_compat()
     test_vendor()
@@ -388,6 +504,7 @@ def main():
     test_profiles_must_be_list()
     test_settings_dialog()
     test_profile_manager_dialog()
+    test_custom_post_profiles()
     print("=" * 50)
     print("ALL llm-settings smoke tests passed ✓")
     print("=" * 50)

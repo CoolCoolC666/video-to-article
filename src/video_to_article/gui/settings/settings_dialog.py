@@ -67,27 +67,62 @@ def _scroll_page(inner: QWidget) -> QScrollArea:
     return scroll
 
 
-class ProfileManagerDialog(QDialog):
-    """大模型配置档案管理（重命名 / 复制 / 删除 / 排序）。
+# 2026-10-04：档案列表的渲染规格 [(字段键, 显示名, 是否敏感)]。
+# 大模型和自定义 POST 共用 ProfileManagerDialog，靠这个规格区分显示内容。
+PROFILE_SPEC_LLM = [
+    ("protocol", "协议", False),
+    ("vendor", "厂商", False),
+    ("model", "模型", False),
+    ("base_url", "BaseURL", False),
+    ("api_key", "Key", True),
+]
+PROFILE_SPEC_ASR = [
+    ("endpoint", "端点", False),
+    ("language", "语言", False),
+    ("api_key", "Key", True),
+    ("headers_file", "请求头文件", False),
+]
 
-    2026-10-04 新增。刻意**不含**导入/导出功能——档案里有 API Key，
-    导出等于给密钥开一个外流口子，收益不匹配风险。
+
+class ProfileManagerDialog(QDialog):
+    """配置档案管理（重命名 / 复制 / 删除 / 排序）。
+
+    2026-10-04 新增。**按字段规格渲染**，所以大模型和自定义 POST 两个引擎
+    能共用这一个弹窗——机制相同（list 存储 + 模板库 + 不可删空），
+    没必要维护两份。
+
+    刻意**不含**导入/导出功能——档案里有 API Key，导出等于给密钥开一个
+    外流口子，收益不匹配风险。
+
+    Args:
+        profiles:    当前档案列表
+        field_spec:  渲染用字段规格 ``[(key, 显示名, 是否敏感), ...]``；
+                     敏感字段在列表里只显示掩码
+        kind_label:  弹窗标题里显示的引擎名
+        dup_hint:    额外提示（不同引擎的档案内容不一样）
 
     删空由调用方拦截（至少要留一个，当前生效配置也依赖档案做模板）。
     """
 
-    def __init__(self, parent, profiles: list) -> None:
+    def __init__(
+        self,
+        parent,
+        profiles: list,
+        field_spec: list,
+        kind_label: str = "配置",
+        dup_hint: str = "「复制」会连 API Key 一起复制（存主力 + 备用常用）。",
+    ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("管理配置档案")
-        self.resize(560, 420)
+        self.setWindowTitle(f"管理{kind_label}配置档案")
+        self.resize(600, 420)
         self._profiles = [dict(p) for p in profiles]
+        self._spec = list(field_spec)
 
         root = QVBoxLayout(self)
         self.list_w = QListWidget()
         self.list_w.itemDoubleClicked.connect(lambda _: self._rename())
         root.addWidget(QLabel(
-            "双击可重命名。\n"
-            "「复制」会连 API Key 一起复制（存主力 + 备用常用）。\n"
+            f"双击可重命名。\n{dup_hint}\n"
             "「删除」不可撤销；至少要保留一个档案。"
         ))
         root.addWidget(self.list_w, 1)
@@ -123,12 +158,15 @@ class ProfileManagerDialog(QDialog):
     def _reload(self) -> None:
         self.list_w.clear()
         for p in self._profiles:
-            key = p.get("api_key") or ""
-            item = QListWidgetItem(
-                f"{p.get('label', p.get('id'))}    "
-                f"[{p.get('vendor') or '?'} / {p.get('model') or '无模型'}]    "
-                f"{mask_secret(key) if key else '（无 Key）'}"
-            )
+            parts = []
+            for key, label, secret in self._spec:
+                v = p.get(key, "")
+                if secret and v:
+                    v = mask_secret(str(v))
+                elif v == "":
+                    v = "—"
+                parts.append(f"{label}={v}")
+            item = QListWidgetItem(f"{p.get('label', p.get('id'))}    " + "  ".join(parts))
             item.setData(Qt.UserRole, p.get("id"))
             self.list_w.addItem(item)
         if self._profiles:
@@ -341,7 +379,9 @@ class SettingsDialog(QDialog):
 
     def _open_profile_manager(self) -> None:
         """打开档案管理弹窗（重命名 / 复制 / 删除）。"""
-        dlg = ProfileManagerDialog(self, self._get_profiles())
+        dlg = ProfileManagerDialog(
+            self, self._get_profiles(), PROFILE_SPEC_LLM, kind_label="大模型"
+        )
         if dlg.exec() != QDialog.Accepted:
             return
         new_profiles = dlg.result_profiles()
@@ -446,6 +486,127 @@ class SettingsDialog(QDialog):
             return float(self.llm_temperature.text().strip() or 0.3)
         except ValueError:
             return 0.3
+
+    # ---------- 自定义 POST（custom_post）档案（2026-10-04）----------
+    # 与 LLM 档案同一套机制，只是字段不同、存在不同的 config 位置：
+    #   LLM        → config["llm"]["profiles"]
+    #   custom_post → config["transcribe"]["custom_post"]["profiles"]
+
+    def _cp_get_profiles(self) -> list:
+        blk = ((self._config.get("transcribe") or {}).get("custom_post") or {})
+        profs = blk.get("profiles")
+        return [dict(p) for p in profs] if isinstance(profs, list) else []
+
+    def _cp_set_profiles(self, profiles: list, keep_active: str | None = None) -> None:
+        tr = self._config.setdefault("transcribe", {})
+        blk = tr.setdefault("custom_post", {})
+        blk["profiles"] = profiles
+        if keep_active is not None:
+            blk["active_profile"] = keep_active
+        self._cp_refresh_profile_combo()
+
+    def _cp_build_profile(self, pid: str, label: str) -> dict:
+        return {
+            "id": pid,
+            "label": label,
+            "endpoint": self.cp_endpoint.text().strip(),
+            "api_key": self.cp_api_key.text().strip(),
+            "headers_file": self.cp_headers_file.text().strip(),
+            "language": self.cp_language.currentData() or "",
+            "mock": self.cp_mock.isChecked(),
+            "role_separation": self.cp_role_separation.isChecked(),
+            "timestamps": self.cp_timestamps.isChecked(),
+            "max_wait_seconds": self.cp_max_wait.value(),
+        }
+
+    def _cp_refresh_profile_combo(self) -> None:
+        cur = self.cp_profile_combo.currentData()
+        self.cp_profile_combo.blockSignals(True)
+        self.cp_profile_combo.clear()
+        for p in self._cp_get_profiles():
+            ep = str(p.get("endpoint") or "")
+            # 只显示 host 部分，列表太窄塞不下完整 URL
+            short = ep.split("//")[-1][:28] if ep else "（无端点）"
+            self.cp_profile_combo.addItem(
+                f"{p.get('label', p.get('id'))}  ·  {short}", p.get("id")
+            )
+        idx = self.cp_profile_combo.findData(cur)
+        if idx >= 0:
+            self.cp_profile_combo.setCurrentIndex(idx)
+        self.cp_profile_combo.blockSignals(False)
+        has = self.cp_profile_combo.count() > 0
+        self.cp_profile_apply_btn.setEnabled(has)
+        self.cp_profile_manage_btn.setEnabled(has)
+
+    def _cp_apply_profile_to_ui(self, prof: dict) -> None:
+        self.cp_endpoint.setText(str(prof.get("endpoint") or ""))
+        self.cp_api_key.setText(str(prof.get("api_key") or ""))
+        self.cp_headers_file.setText(str(prof.get("headers_file") or ""))
+        lang = str(prof.get("language") or "")
+        li = self.cp_language.findData(lang)
+        self.cp_language.setCurrentIndex(li if li >= 0 else 0)
+        self.cp_mock.setChecked(bool(prof.get("mock", True)))
+        self.cp_role_separation.setChecked(bool(prof.get("role_separation", False)))
+        self.cp_timestamps.setChecked(bool(prof.get("timestamps", True)))
+        try:
+            self.cp_max_wait.setValue(int(prof.get("max_wait_seconds") or 300))
+        except (TypeError, ValueError):
+            self.cp_max_wait.setValue(300)
+
+    def _cp_save_current_as_profile(self) -> None:
+        name, ok = QInputDialog.getText(
+            self, "新建自定义 POST 档案",
+            "档案名称（例如：MiniMax 官方 / 私有网关）：",
+        )
+        if not ok or not name.strip():
+            return
+        profiles = self._cp_get_profiles()
+        pid = f"cp{len(profiles) + 1}_{int(time.time())}"
+        profiles.append(self._cp_build_profile(pid, name.strip()))
+        self._cp_set_profiles(profiles, keep_active=pid)
+        QMessageBox.information(
+            self, "已保存",
+            f"档案「{name.strip()}」已保存。\n"
+            f"点主对话框的「保存」才会写进 config.json。",
+        )
+
+    def _cp_apply_selected_profile(self) -> None:
+        pid = self.cp_profile_combo.currentData()
+        prof = next((p for p in self._cp_get_profiles() if p.get("id") == pid), None)
+        if not prof:
+            QMessageBox.information(self, "档案", "请先在下拉框里选一个档案。")
+            return
+        self._cp_apply_profile_to_ui(prof)
+        QMessageBox.information(
+            self, "已应用",
+            f"档案「{prof.get('label')}」已套用到当前配置。\n记得点「保存」写盘。",
+        )
+
+    def _cp_open_profile_manager(self) -> None:
+        dlg = ProfileManagerDialog(
+            self,
+            self._cp_get_profiles(),
+            PROFILE_SPEC_ASR,
+            kind_label="自定义（POST）",
+            dup_hint="「复制」会连 API Key 和请求头文件路径一起复制。\n"
+                     "若两个 Provider 用不同的请求头文件，记得复制后改一下路径。",
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+        new_profiles = dlg.result_profiles()
+        if not new_profiles:
+            QMessageBox.warning(
+                self, "不能删空",
+                "至少要保留一个档案。\n若只想清理，请先「把当前存为新档案」再删。",
+            )
+            return
+        active = self.cp_profile_combo.currentData()
+        self._cp_set_profiles(new_profiles, keep_active=active)
+        QMessageBox.information(
+            self, "档案已更新",
+            f"当前共 {len(new_profiles)} 个自定义 POST 档案。\n"
+            f"记得点主对话框的「保存」写进 config.json。",
+        )
 
     def _on_cover_enable_toggled(self, checked: bool) -> None:
         if self._cover_pipeline_syncing:
@@ -973,6 +1134,36 @@ class SettingsDialog(QDialog):
         mmform.addRow("单请求超时（秒）", self.cp_max_wait)
         outer.addWidget(mm_box)
 
+        # === 2026-10-04：自定义 POST 的配置档案区（与 LLM 同机制）===
+        # 为什么要：切一个云端 Provider 要手打「端点 + Key + 请求头文件路径」三件套，
+        #   而不同 Provider 的鉴权方式还各不相同（Bearer / 自定义头 / 私有网关）。
+        cp_prof_box = QGroupBox("自定义（POST）配置档案")
+        cp_prof_lay = QVBoxLayout(cp_prof_box)
+        self.cp_profile_combo = QComboBox()
+        self.cp_profile_combo.setToolTip(
+            "已保存的自定义 POST 配置档案。选中一个点「应用到当前」即可套用。\n"
+            "档案是**模板库**：改档案不会自动改上面的字段，\n"
+            "需要点「应用到当前」才会覆盖（避免「以为在改档案，其实改的是当前配置」）。\n\n"
+            "注意：每个档案可以指向**不同的请求头文件**，这样不同 Provider 的\n"
+            "非 Bearer 鉴权（自定义头 / 私有网关 token）就能各存各的，互不干扰。"
+        )
+        cp_btn_row = QWidget()
+        cpbtn = QHBoxLayout(cp_btn_row)
+        cpbtn.setContentsMargins(0, 0, 0, 0)
+        self.cp_profile_apply_btn = QPushButton("应用到当前")
+        self.cp_profile_apply_btn.clicked.connect(self._cp_apply_selected_profile)
+        self.cp_profile_new_btn = QPushButton("把当前存为新档案")
+        self.cp_profile_new_btn.clicked.connect(self._cp_save_current_as_profile)
+        self.cp_profile_manage_btn = QPushButton("管理…")
+        self.cp_profile_manage_btn.clicked.connect(self._cp_open_profile_manager)
+        cpbtn.addWidget(self.cp_profile_apply_btn)
+        cpbtn.addWidget(self.cp_profile_new_btn)
+        cpbtn.addWidget(self.cp_profile_manage_btn)
+        cpbtn.addStretch(1)
+        cp_prof_lay.addWidget(self.cp_profile_combo)
+        cp_prof_lay.addWidget(cp_btn_row)
+        outer.addWidget(cp_prof_box)
+
         mm_tip = QLabel(
             "💡 自定义 POST 云端 ASR（默认按 MiniMax asr-1.0 契约实现）：\n"
             "  · 接口地址可改 → 指向私有部署 / 网关 / 任何兼容服务\n"
@@ -1429,6 +1620,9 @@ class SettingsDialog(QDialog):
             self.cp_max_wait.setValue(int(ca.get("max_wait_seconds") or 300))
         except (TypeError, ValueError):
             self.cp_max_wait.setValue(300)
+        # 2026-10-04：把 custom_post 档案灌进内存，供「应用到当前 / 管理…」用
+        tr.setdefault("custom_post", ca)
+        self._cp_refresh_profile_combo()
 
         yt = self._config.get("youtube") or {}
         browser = str(yt.get("cookies_from_browser") or "")
@@ -1520,6 +1714,25 @@ class SettingsDialog(QDialog):
             llm_updates["profiles"] = profiles
             llm_updates["active_profile"] = self.llm_profile_combo.currentData() or ""
 
+        # custom_post 当前生效值（2026-10-04）
+        cp_updates = {
+            "endpoint": self.cp_endpoint.text().strip() or DEFAULT_ENDPOINT,
+            "api_key": self.cp_api_key.text().strip(),
+            "headers_file": self.cp_headers_file.text().strip(),
+            "language": self.cp_language.currentData() or "",
+            "mock": self.cp_mock.isChecked(),
+            "role_separation": self.cp_role_separation.isChecked(),
+            "timestamps": self.cp_timestamps.isChecked(),
+            "max_wait_seconds": self.cp_max_wait.value(),
+        }
+        # custom_post 档案（2026-10-04）。
+        # ⚠ profiles 必须是 list：deep_update 对 list 整体替换、对 dict 递归合并，
+        #   存成 dict 时「删除档案」只会 merge 覆盖，删掉的 key 残留成幽灵档案。
+        cp_profiles = self._cp_get_profiles()
+        if cp_profiles:
+            cp_updates["profiles"] = cp_profiles
+            cp_updates["active_profile"] = self.cp_profile_combo.currentData() or ""
+
         return {
             "llm": llm_updates,
             "transcribe": {
@@ -1555,16 +1768,7 @@ class SettingsDialog(QDialog):
                     "colloquial_proc": self.xf_colloquial_proc.isChecked(),
                     "timestamps": self.xf_timestamps.isChecked(),
                 },
-                "custom_post": {
-                    "endpoint": self.cp_endpoint.text().strip() or DEFAULT_ENDPOINT,
-                    "api_key": self.cp_api_key.text().strip(),
-                    "headers_file": self.cp_headers_file.text().strip(),
-                    "language": self.cp_language.currentData() or "",
-                    "mock": self.cp_mock.isChecked(),
-                    "role_separation": self.cp_role_separation.isChecked(),
-                    "timestamps": self.cp_timestamps.isChecked(),
-                    "max_wait_seconds": self.cp_max_wait.value(),
-                },
+                "custom_post": cp_updates,
             },
             "youtube": {
                 "cookies_from_browser": self.yt_browser.currentData() or "",

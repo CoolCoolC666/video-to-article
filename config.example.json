@@ -26,6 +26,18 @@
       "language": "cn",
       "mock": true,
       "max_wait_seconds": 600
+    },
+    "custom_post": {
+      "endpoint": "https://api.minimax.cn/v1/speech_to_text",
+      "api_key": "your-api-key-here",
+      "headers_file": "",
+      "language": "zh",
+      "mock": true,
+      "role_separation": false,
+      "timestamps": true,
+      "max_wait_seconds": 300,
+      "active_profile": "",
+      "profiles": []
     }
   },
   "youtube": {

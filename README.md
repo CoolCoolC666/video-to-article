@@ -419,6 +419,8 @@ xf_asr 集成期间按以下顺序踩坑订正协议层（每个 fix 都加 smok
 | **模型列表自动抓取** | 「⟳ 抓取」按钮 → `GET {base_url}/models`，后台线程不阻塞 UI，结果进 **Model 可编辑下拉**<br>**抓取失败绝不清空已填内容、绝不阻断保存** | Model 名（如 `MiniMax-M2.7-highspeed`）手打极易错；且不是所有 provider 都提供 `/models`，必须留手填口子 |
 | **抓取走 requests 直连而非 openai SDK** | 新增 `providers/llm_models.py`，**不用 `client.models.list()`** | 实测 `openai 3.8.0` 缺 `jiter`（`pyproject` 只声明 `openai>=1.0.0`），`client.models` 属性访问直接 `ModuleNotFoundError`；`c.chat` 懒加载所以现有转写不受影响 |
 | **多配置档案 + 右下角管理入口** | 「设置 → 转写 → 大模型」顶部档案区（应用到当前 / 存为新档案 / 管理…）<br>对话框**右下角**另有「管理配置档案…」（放在 Save/Cancel 左侧，不破坏 Save 最右的肌肉记忆）<br>管理弹窗支持重命名 / 复制 / 删除 / 排序，**不可删空** | 切厂商不用每次手打 API Key + Base URL + Model 三件套 |
+| **`custom_post` 也有同一套档案** | 「设置 → 转写 → 自定义（POST）」下方独立档案区，存 `transcribe.custom_post.profiles`<br>**每个档案可指向不同的请求头文件** | 切一个云端 ASR Provider 要手打「端点 + Key + 请求头文件路径」，而不同 Provider 的鉴权方式还各不相同（Bearer / 自定义头 / 私有网关 token）——档案让它们各存各的互不干扰 |
+| **一个弹窗两处复用** | `ProfileManagerDialog` 按 `PROFILE_SPEC_LLM` / `PROFILE_SPEC_ASR` 两套字段规格渲染 | 机制完全相同（list 存储 + 模板库 + 不可删空），没必要维护两份 |
 | **档案与当前配置：8 字段为准，档案是模板库** | 改档案不自动改下方字段，需点「应用到当前」才覆盖 | 避免「以为在改档案、其实改的是当前配置」；`providers/llm.py` 一行不用改，零回归 |
 | **⚠ profiles 存 list 而不是 dict** | 见下方说明 | 这是本设计最容易埋雷的一处 |
 

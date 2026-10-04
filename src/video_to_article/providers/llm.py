@@ -11,8 +11,24 @@ logger = configure_logging()
 
 # 2026-10-04: max_tokens 被服务端拒绝时的降级目标。
 # 各家上限不同且会变（实测 DeepSeek 为 [1, 393216]），硬编码上限必然过时，
-# 所以只在真的撞到 max_tokens 报错时才降到这个「几乎所有厂商都接受」的值。
+# 所以优先从**错误信息里解析真实范围**（DeepSeek 就会写明），解析不到才退到
+# 这个「几乎所有厂商都接受」的值。
 _FALLBACK_MAX_TOKENS = 65536
+# 形如 "the valid range of max_tokens is [1, 393216]"
+_MAX_TOKENS_RANGE_RE = re.compile(
+    r"max_tokens[^\[\]]*\[\s*(\d+)\s*,\s*(\d+)\s*\]", re.IGNORECASE
+)
+
+
+def _max_tokens_ceiling(error_text: str) -> int:
+    """从报错里抠出服务端真实的 max_tokens 上限，取不到返回 0。"""
+    m = _MAX_TOKENS_RANGE_RE.search(str(error_text or ""))
+    if not m:
+        return 0
+    try:
+        return int(m.group(2))
+    except (TypeError, ValueError):
+        return 0
 
 # 2026-09-12: 剥离推理模型（M3 / Qwen3 等）输出开头的 <think>...</think> 思维链块
 # 规则：只处理开头首个块（含前后空白），不破坏正文
@@ -118,10 +134,13 @@ def _optimize_with_openai(text: str, config: dict, prompt_name: str) -> Optional
             msg = str(first_exc)
             if "max_tokens" not in msg:
                 raise
-            safe = _FALLBACK_MAX_TOKENS
+            # 优先用服务端自己报出来的上限（比任何硬编码都准）
+            ceiling = _max_tokens_ceiling(msg)
+            safe = ceiling if ceiling > 0 else _FALLBACK_MAX_TOKENS
             logger.warning(
-                f"max_tokens={want_max} 被服务端拒绝（各家上限不同，"
-                f"实测 DeepSeek 上限 393216）。自动降到 {safe} 重试一次。"
+                f"max_tokens={want_max} 被服务端拒绝（各家上限不同）。"
+                + (f"服务端报告上限为 {ceiling}，降到 {safe} 重试一次。"
+                   if ceiling else f"未能从报错里读出上限，先降到 {safe} 重试一次。")
             )
             want_max = safe
             response = _create(want_max)

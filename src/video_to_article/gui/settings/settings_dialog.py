@@ -52,7 +52,7 @@ from ...media.custom_post_asr import (
     default_headers_file,
     write_headers_template,
 )
-from ...providers.llm_models import fetch_models
+from ...providers.llm_models import fetch_model_limits, fetch_models, format_limit_hint
 from ..asr_engines import ASR_ENGINE_LABELS, normalize_engine
 from ..profile_store import (
     PROFILE_SPEC_ASR,
@@ -229,6 +229,9 @@ class SettingsDialog(ProfileMixin, QDialog):
         self._config: dict[str, Any] = {}
         # 2026-10-04：最近一次抓到的模型列表，存档案时一起带进 models_cache
         self._last_fetched_models: list = []
+        # 2026-10-05：抓模型时顺带拿到的各模型输出上限（部分厂商不返回）
+        # {model_id: {"max_output_tokens": int, "context_window": int}}
+        self._last_model_limits: dict = {}
 
         root = QVBoxLayout(self)
         self.tabs = QTabWidget()
@@ -286,7 +289,7 @@ class SettingsDialog(ProfileMixin, QDialog):
         from PySide6.QtCore import QThread
 
         class _FetchThread(QThread):
-            done = Signal(object, object)  # (models, error)
+            done = Signal(object, object, object)  # (models, error, limits)
 
             def __init__(self, url: str, key: str):
                 super().__init__()
@@ -296,9 +299,10 @@ class SettingsDialog(ProfileMixin, QDialog):
             def run(self) -> None:
                 try:
                     models, err = fetch_models(self._url, self._key)
+                    limits = {} if err else fetch_model_limits(self._url, self._key)
                 except Exception as e:  # 兜底：线程里绝不让异常冒出去
-                    models, err = [], f"{type(e).__name__}: {e}"
-                self.done.emit(models, err)
+                    models, err, limits = [], f"{type(e).__name__}: {e}", {}
+                self.done.emit(models, err, limits)
 
         self._fetch_thread = _FetchThread(base_url, api_key)
         self._fetch_thread.done.connect(self._on_fetch_models_done)
@@ -307,7 +311,7 @@ class SettingsDialog(ProfileMixin, QDialog):
         )
         self._fetch_thread.start()
 
-    def _on_fetch_models_done(self, models: list, err) -> None:
+    def _on_fetch_models_done(self, models: list, err, limits: dict = None) -> None:
         """抓取线程回调。⚠ 失败时**绝不清空** Model 已有的内容。"""
         self.llm_model_fetch_btn.setText("⟳ 抓取")
         current = self.llm_model.currentText().strip()
@@ -323,18 +327,38 @@ class SettingsDialog(ProfileMixin, QDialog):
 
         # 保留用户已填的值（即使在列表里也别冲掉它——那可能是服务端已下线的模型）
         self._last_fetched_models = list(models)
+        self._last_model_limits = dict(limits or {})
         self.llm_model.clear()
         if current:
             self.llm_model.addItem(current)
         self.llm_model.addItems(models)
         self.llm_model.setCurrentIndex(0)
-        QMessageBox.information(
-            self,
-            "抓取模型成功",
+
+        # 顺带把「当前模型的输出上限」告诉用户 —— max_tokens 配超会被服务端
+        # 400 静默拒绝（发生在请求发出前），界面上只剩「成稿没生成」一条线索。
+        target = current or (models[0] if models else "")
+        hint = format_limit_hint(target, self._last_model_limits) if target else ""
+        msg = (
             f"已获取 {len(models)} 个模型，已填入下拉框。\n\n"
             + "\n".join(models[:20])
-            + (f"\n… 还有 {len(models) - 20} 个" if len(models) > 20 else ""),
+            + (f"\n… 还有 {len(models) - 20} 个" if len(models) > 20 else "")
         )
+        if hint:
+            msg += f"\n\n💡 {hint}"
+            ceiling = (self._last_model_limits.get(target) or {}).get("max_output_tokens")
+            if ceiling and self.llm_max_tokens.value() > ceiling:
+                msg += (
+                    f"\n⚠ 你当前填的 max_tokens="
+                    f"{self.llm_max_tokens.value():,} 超过了这个上限，"
+                    f"保存后生成成稿会被服务端拒绝（且**界面上看不出原因**）。"
+                    f"\n   建议改成 {ceiling:,} 或以下。"
+                )
+        else:
+            msg += (
+                "\n\n💡 该服务未在 /models 里报告输出上限，"
+                "max_tokens 请按服务商文档填写（配超会被静默拒绝）。"
+            )
+        QMessageBox.information(self, "抓取模型成功", msg)
 
     # 2026-10-04：档案机制（存/应用/管理/读写）已抽到 profile_store.ProfileMixin，
     # 四处档案区共用同一套实现。本类只在 PROFILES 里声明各自的字段。

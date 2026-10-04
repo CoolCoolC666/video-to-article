@@ -104,6 +104,111 @@ def parse_models_response(payload) -> List[str]:
     return out
 
 
+def parse_model_limits(payload) -> dict:
+    """顺带从 /models 响应里提取**每个模型的输出上限**。
+
+    为什么值得做：max_tokens 配超了会被服务端 400 静默拒绝
+    （实测 DeepSeek：``Invalid max_tokens value, the valid range of max_tokens
+    is [1, 393216]``），而那个 400 发生在**请求发出前**，
+    界面上只剩「成稿没生成」一条线索，完全指不到 max_tokens。
+
+    实测（2026-10-05，真实 base_url，只读）：
+        DeepSeek /models  → 带 max_output_tokens / context_window  ✅
+                            {"id":"deepseek-flash", "max_output_tokens":393216,
+                             "context_window":1048576, ...}
+        MiniMax  /models  → 只有 id/object/created/owned_by        ❌
+    所以**一半厂商拿得到** —— 拿不到就照旧靠降级兜底，不影响任何功能。
+
+    Returns:
+        ``{model_id: {"max_output_tokens": int, "context_window": int}}``
+        只含确实解析到的字段；结构不认识时返回 {}（不抛异常）。
+    """
+    out: dict = {}
+    if not isinstance(payload, dict):
+        return out
+    items = payload.get("data")
+    if not isinstance(items, list):
+        items = payload.get("models")
+    if not isinstance(items, list):
+        return out
+
+    # 各家可能用的键名（第一个命中即用）
+    out_keys = ("max_output_tokens", "max_tokens", "maxOutputTokens",
+                "maxinstruct", "output_token_limit")
+    ctx_keys = ("context_window", "context_length", "max_context_tokens",
+                "maxContextTokens", "contextWindow")
+
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        mid = None
+        for key in ("id", "name", "model", "model_name"):
+            v = it.get(key)
+            if isinstance(v, str) and v.strip():
+                mid = v.strip()
+                break
+        if not mid:
+            continue
+        info: dict = {}
+        for keys, target in ((out_keys, "max_output_tokens"), (ctx_keys, "context_window")):
+            for k in keys:
+                v = it.get(k)
+                if isinstance(v, (int, float)) and v > 0:
+                    info[target] = int(v)
+                    break
+                # 有些服务给的是字符串
+                if isinstance(v, str) and v.strip().isdigit():
+                    info[target] = int(v.strip())
+                    break
+        if info:
+            out[mid] = info
+    return out
+
+
+def format_limit_hint(model: str, limits: dict) -> str:
+    """把上限信息拼成一句能直接贴给用户看的话。"""
+    if not isinstance(limits, dict):
+        return ""
+    info = limits.get(model)
+    if not info:
+        return ""
+    parts = []
+    if info.get("max_output_tokens"):
+        parts.append(f"max_tokens 上限 {info['max_output_tokens']:,}")
+    if info.get("context_window"):
+        parts.append(f"上下文 {info['context_window']:,}")
+    if not parts:
+        return ""
+    return f"服务端报告 {model}：" + "，".join(parts) + "。"
+
+
+def fetch_model_limits(base_url: str, api_key: str, timeout: int = DEFAULT_TIMEOUT) -> dict:
+    """单独抓一次 /models 只为拿输出上限（GUI 提示用）。
+
+    为什么不复用 fetch_models 的返回值：那个函数的契约是
+    ``(models, error)``，已经被 GUI / 档案 / 测试依赖。改签名会波及一串调用点，
+    而拿上限是**附加信息**——拿不到也不该影响任何既有行为。
+    """
+    url = build_models_url(base_url)
+    if not url:
+        return {}
+    try:
+        requests = import_required("requests", "requests")
+    except Exception:
+        return {}
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        resp = requests.get(f"{url}{_LIST_QUERY}", headers=headers, timeout=timeout)
+        if resp.status_code != 200:
+            return {}
+        return parse_model_limits(json.loads(resp.text))
+    except Exception:
+        # 纯附加信息，拿不到就当没有 —— 绝不影响抓取本身
+        return {}
+
+
 def fetch_models(
     base_url: str,
     api_key: str,
@@ -158,5 +263,11 @@ def fetch_models(
 
     # ⚠ 只打条数，**不打印 key**，也不把整个列表刷进日志。
     # url 也用本地拼的那个，不碰 resp.request（stub / 某些 transport 没有该属性）。
-    logger.info(f"已从服务端抓取 {len(models)} 个模型（{url}）")
+    limits = parse_model_limits(payload)
+    with_limits = [m for m in models if m in limits]
+    logger.info(
+        f"已从服务端抓取 {len(models)} 个模型（{url}）"
+        + (f"，其中 {len(with_limits)} 个带输出上限" if with_limits else
+           "（该服务未报告输出上限）")
+    )
     return models, None

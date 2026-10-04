@@ -774,7 +774,8 @@ def test_max_tokens_degrade():
             prompt_name="general_article",
         )
         assert out == "成稿", out
-        assert calls == [520000, L._FALLBACK_MAX_TOKENS], calls
+        # 报错里带范围 → 降到**服务端真实上限**，不是保守的固定值
+        assert calls == [520000, 393216], calls
 
         # ② 未撞上限时不该多发一次请求
         calls.clear()
@@ -813,10 +814,98 @@ def test_max_tokens_degrade():
         )
         assert out3 is None, f"鉴权失败应返回 None 而非硬重试: {out3!r}"
         assert calls == [520000], f"非 max_tokens 错误不该重试: {calls}"
+
+        # ④ 报错指向 max_tokens 但**没给范围** → 回落到保守固定值
+        calls.clear()
+
+        class BoomNoRange(FakeCompletions):
+            def create(self, **kw):
+                calls.append(kw.get("max_tokens"))
+                if len(calls) == 1:
+                    raise BoomMaxTokens("max_tokens is too large for this model")
+                return Ok()
+
+        FakeChat.completions = BoomNoRange()
+        out4 = L.optimize_text_with_llm(
+            "转写稿",
+            {"llm": {"api_key": "k", "base_url": "https://x", "model": "m",
+                      "max_tokens": 520000}},
+            prompt_name="general_article",
+        )
+        assert out4 == "成稿", out4
+        assert calls == [520000, L._FALLBACK_MAX_TOKENS], (
+            f"没范围信息时应回落到保守值: {calls}"
+        )
     finally:
         _openai_mod.OpenAI = orig_client
         L.load_prompt = orig_prompt
     print("OK 13: max_tokens 超限自动降级重试（非 max_tokens 错误不重试）\n")
+
+
+def test_model_limits_parsing():
+    """抓模型时顺带拿输出上限 —— 实测**一半厂商给，一半不给**：
+
+    DeepSeek /models → max_output_tokens / context_window  ✅
+    MiniMax  /models → 只有 id/object/created/owned_by    ❌
+    """
+    from video_to_article.providers.llm_models import (
+        format_limit_hint,
+        parse_model_limits,
+    )
+
+    # DeepSeek 实测真实响应
+    ds = {"object": "list", "data": [{
+        "id": "deepseek-flash", "object": "model", "owned_by": "deepseek",
+        "name": "DeepSeek-V4.1-Flash", "context_window": 1048576,
+        "max_output_tokens": 393216, "input_modalities": ["text", "image"],
+    }]}
+    lim = parse_model_limits(ds)
+    assert lim == {"deepseek-flash": {"max_output_tokens": 393216,
+                                      "context_window": 1048576}}, lim
+    h = format_limit_hint("deepseek-flash", lim)
+    assert "393,216" in h or "393216" in h, h
+    assert "1,048,576" in h or "1048576" in h, h
+
+    # MiniMax 实测真实响应 —— 没有上限字段，应返回 {} 而不是瞎猜
+    mm = {"object": "list", "data": [
+        {"id": "MiniMax-M3", "object": "model",
+         "created": 1780272000, "owned_by": "minimax"}]}
+    assert parse_model_limits(mm) == {}, parse_model_limits(mm)
+    assert format_limit_hint("MiniMax-M3", {}) == ""
+
+    # 兼容各种别名 / 字符串数字
+    alias = {"data": [
+        {"model_name": "m1", "maxOutputTokens": "8192"},          # Ollama 风格 + 字符串
+        {"id": "m2", "max_tokens": 4096},
+        {"id": "m3", "context_length": 128000},                     # 只有上下文
+        {"id": "m4"},                                               # 什么都没有
+    ]}
+    a = parse_model_limits(alias)
+    assert a["m1"]["max_output_tokens"] == 8192, a
+    assert a["m2"]["max_output_tokens"] == 4096, a
+    assert a["m3"]["context_window"] == 128000, a
+    assert "m4" not in a, a
+
+    # 结构不认识时返回 {}，绝不抛
+    for junk in (None, [], {}, {"data": "x"}, {"models": {"a": 1}}):
+        assert parse_model_limits(junk) == {}, junk
+    print("OK 14: /models 上限解析（DeepSeek 有 / MiniMax 无 / 各种别名 / 垃圾结构不抛）\n")
+
+
+def test_max_tokens_ceiling_from_error():
+    """从报错里解析真实上限 —— 比任何硬编码都准。"""
+    from video_to_article.providers.llm import _max_tokens_ceiling
+
+    # DeepSeek 实测报错原文
+    assert _max_tokens_ceiling(
+        "Invalid max_tokens value, the valid range of max_tokens is [1, 393216]"
+    ) == 393216
+    # 大小写 / 空格 / 缺空格
+    assert _max_tokens_ceiling("MAX_TOKENS is [1 , 8192]") == 8192
+    # 没有范围信息 → 0（调用方回落到保守值）
+    for noinfo in ("max_tokens is too large", "", None, "rate limited"):
+        assert _max_tokens_ceiling(noinfo) == 0, noinfo
+    print("OK 15: 从 max_tokens 报错里解析服务端真实上限\n")
 
 
 def main():
@@ -833,6 +922,8 @@ def main():
     test_cover_and_host_profiles()
     test_engine_focus_ui()
     test_max_tokens_degrade()
+    test_model_limits_parsing()
+    test_max_tokens_ceiling_from_error()
     print("=" * 50)
     print("ALL llm-settings smoke tests passed ✓")
     print("=" * 50)

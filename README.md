@@ -267,10 +267,23 @@ fork **新增** `src/video_to_article/media/custom_post_asr.py`。最初是「Mi
 
 **模型名**（DashScope 必填，OpenAI 兼容风格下该字段被忽略）：
 
+> ⚠ **最容易踩的坑：同系列两个名字只差一个后缀，含义完全不同。**
+>
+> | 模型 | 音频时长 | 调用方式 |
+> |---|---|---|
+> | `qwen3-asr-flash` | ≤ **5 分钟** | **同步**（一次请求直接返回）|
+> | `qwen3-asr-flash-filetrans` | ≤ **12 小时** | **异步**（提交 → 轮询 → 下载）|
+>
+> 本引擎走的是**异步**流程，填了前者会被服务端拒绝，而错误只有一句英文
+> `current user api does not support asynchronous calls`，**完全看不出是少抄了后缀**。
+> 程序已加提交前预检：填了同步模型会直接告诉你该用哪个（且**不会发出请求**，不白花钱）。
+
+异步风格下可用的模型名：
+
 ```
-paraformer-v2                        通用，支持 language_hints + 说话人分离
-qwen3-asr-flash-filetrans            Qwen3，异步
-qwen-audio-3.1-asr-flash-filetrans   Qwen-Audio，异步
+qwen3-asr-flash-filetrans          Qwen3，长音频（推荐）
+qwen-audio-3.1-asr-flash-filetrans  Qwen-Audio
+paraformer-v2                       通用，支持 language_hints + 说话人分离
 ```
 
 > ⚠ **开了说话人分离后，官方建议音频不超过 2 小时**，否则可能失败或超时

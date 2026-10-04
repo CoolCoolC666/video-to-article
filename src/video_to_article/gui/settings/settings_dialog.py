@@ -1054,10 +1054,17 @@ class SettingsDialog(ProfileMixin, QDialog):
         self.cp_model = QLineEdit()
         self.cp_model.setPlaceholderText("仅 DashScope 异步需要，如 paraformer-v2")
         self.cp_model.setToolTip(
-            "DashScope 异步必填。官方文档列的模型：\n"
-            "  paraformer-v2                          通用，支持 language_hints + 说话人分离\n"
-            "  qwen3-asr-flash-filetrans               Qwen3，异步\n"
-            "  qwen-audio-3.1-asr-flash-filetrans      Qwen-Audio，异步\n\n"
+            "DashScope 异步**必填**，且只能填「长音频/异步」那一族。\n\n"
+            "⚠ 同系列有两个名字，**只差一个 -filetrans 后缀**，极易抄错：\n"
+            "    qwen3-asr-flash            短音频 ≤5 分钟   同步   ❌ 不能用\n"
+            "    qwen3-asr-flash-filetrans   长音频 ≤12 小时  异步   ✅ 用这个\n"
+            "  填错的话服务端只回英文\n"
+            "  'current user api does not support asynchronous calls'，\n"
+            "  完全看不出是少抄了后缀。\n\n"
+            "可直接填的异步模型名：\n"
+            "  qwen3-asr-flash-filetrans          Qwen3，长音频（推荐）\n"
+            "  qwen-audio-3.1-asr-flash-filetrans  Qwen-Audio\n"
+            "  paraformer-v2                       通用，支持 language_hints + 说话人分离\n\n"
             "OpenAI 兼容风格下这个字段被忽略（协议里 model 由程序固定为 asr-1.0）。"
         )
 

@@ -780,6 +780,43 @@ def _dashscope_headers(api_key: str, extra: Optional[Dict[str, str]] = None) -> 
     return headers
 
 
+# === 同步 / 异步模型对照（2026-10-04 实测踩到）===
+# DashScope 的 ASR 模型**按音频长度分成两族，名字只差一个后缀**：
+#   短音频（≤5 分钟）  qwen3-asr-flash        → **同步**，一次请求直接返回
+#   长音频（≤12 小时） qwen3-asr-flash-filetrans → **异步**，提交+轮询
+# 拿同步模型去打异步端点，服务端只回一句英文
+#   current user api does not support asynchronous calls
+# 完全看不出「只是少抄了 -filetrans」。这个坑很容易踩，必须在本地拦。
+# ⚠ 只列**明确已知**的同步模型，不做「没在异步表里就报错」的推断 ——
+#   厂商加新模型时不该让程序反过来挡住可用模型。
+_DASHSCOPE_SYNC_ONLY_MODELS = {
+    "qwen3-asr-flash": "qwen3-asr-flash-filetrans",
+    "qwen3-asr-flash-realtime": "qwen3-asr-flash-filetrans",
+    "qwen3-asr-flash-latest": "qwen3-asr-flash-filetrans",
+    "paraformer-realtime-v2": "paraformer-v2",
+}
+
+
+def _reject_sync_only_model(model: str) -> None:
+    """填了只支持同步的模型时，在发请求前用中文说清该用哪个。"""
+    m = str(model or "").strip()
+    if not m:
+        return
+    async_name = _DASHSCOPE_SYNC_ONLY_MODELS.get(m.lower())
+    if not async_name:
+        return
+    raise RuntimeError(
+        f"模型 {m} 是**同步**模型（只支持 ≤5 分钟音频、一次请求直接返回），"
+        "不能用于 DashScope 异步风格。\n\n"
+        f"请把「模型名」改成：{async_name}\n\n"
+        "两个名字只差一个 -filetrans 后缀，含义完全不同：\n"
+        f"  {m:28s} 短音频 ≤5 分钟   同步\n"
+        f"  {async_name:28s} 长音频 ≤12 小时  异步（提交 → 轮询 → 下载）\n"
+        "服务端只会回 'current user api does not support asynchronous calls'，"
+        "看不出是这个原因。"
+    )
+
+
 def _dashscope_submit(
     base_url: str,
     api_key: str,
@@ -808,6 +845,7 @@ def _dashscope_submit(
             "DashScope 模式必须填模型名（如 paraformer-v2 / qwen3-asr-flash-filetrans / "
             "qwen-audio-3.1-asr-flash-filetrans）。"
         )
+    _reject_sync_only_model(model)
     # 官方明确警告：URL 含空格/中文必须先 percent-encode，
     # 否则报 InvalidFile.DownloadFailed。用户的课件文件名几乎都是中文。
     safe_url = urllib.parse.quote(audio_url, safe=":/?#[]@!$&'()*+,;=")

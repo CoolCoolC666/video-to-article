@@ -662,6 +662,45 @@ def test_credential_shape_warning():
     print("OK 11: 密钥形态预检（正确密钥不打扰 / 拿错字段中文点明 / 不回显密钥 / OSS 不误报）")
 
 
+# ------------------- 12. 同步模型误用于异步端点（用户实测卡住的地方）
+def test_sync_only_model_rejected():
+    """`qwen3-asr-flash` 和 `qwen3-asr-flash-filetrans` 只差一个后缀，
+    但前者是**同步**模型（≤5 分钟），打异步端点会被服务端拒：
+        current user api does not support asynchronous calls
+    这句英文完全看不出原因，必须在本地拦下来并说清该用哪个。
+    """
+    # 必须拦下并给出替代名
+    for bad, good in (
+        ("qwen3-asr-flash", "qwen3-asr-flash-filetrans"),
+        ("Qwen3-ASR-Flash", "qwen3-asr-flash-filetrans"),   # 大小写
+        ("  qwen3-asr-flash  ", "qwen3-asr-flash-filetrans"),  # 空格
+        ("paraformer-realtime-v2", "paraformer-v2"),
+    ):
+        s = use(FakeSession(post_script=[FakeResp(200, {"output": {"task_id": "t"}})]))
+        try:
+            _dashscope_submit(BASE, "K", bad, "https://x.com/a.mp3", "")
+            raise SystemExit(f"{bad!r} 应该被拦下但没拦")
+        except RuntimeError as e:
+            msg = str(e)
+            assert good in msg, f"应直接给出正确模型名 {good}: {msg}"
+            assert "同步" in msg, msg
+        finally:
+            done()
+        # ⚠ 关键：拦下时**不能已经发出请求**（否则照样被服务端拒、还白花钱）
+        assert not s.posts, f"{bad!r} 应在发请求前就被拦下，却已发出 {len(s.posts)} 个请求"
+
+    # 正确模型必须放行
+    for ok in ("qwen3-asr-flash-filetrans", "qwen-audio-3.1-asr-flash-filetrans",
+               "paraformer-v2", "某个将来新增的异步模型"):
+        s = use(FakeSession(post_script=[FakeResp(200, {"output": {"task_id": "t"}})]))
+        try:
+            _dashscope_submit(BASE, "K", ok, "https://x.com/a.mp3", "")
+        finally:
+            done()
+        assert s.posts, f"{ok!r} 是合法异步模型，不该被拦"
+    print("OK 12: 同步模型名（qwen3-asr-flash）发请求前拦下并指向 filetrans；异步模型放行")
+
+
 def main():
     test_endpoint_building()
     test_submit_body()
@@ -677,6 +716,7 @@ def main():
     test_s3_dispatch_exists()
     test_host_field_groups_mutually_exclusive()
     test_credential_shape_warning()
+    test_sync_only_model_rejected()
     print()
     print("smoke_dashscope_asr: 全部通过 ✓")
 

@@ -252,7 +252,8 @@ fork **新增** `src/video_to_article/media/custom_post_asr.py`。最初是「Mi
 
 | 改动 | 内容 | 为什么改 |
 |------|------|----------|
-| **借图床换公网 URL** | `upload_audio_for_public_url()` 复用 `cover.upload_image_to_host`（通用 multipart，EasyImage 能收 mp3）；没配图床时给**三选一**可操作提示 | DashScope 文件级 ASR **硬性要求公网 URL**，不接受文件上传 |
+| **借图床换公网 URL** | `upload_audio_for_public_url()` 复用 `cover.upload_image_to_host`（EasyImage 图床能收 mp3）；没配图床时给**三选一**可操作提示 | DashScope 文件级 ASR **硬性要求公网 URL**，不接受文件上传 |
+| **图床支持 R2 / OSS** | `image_host.provider` 可选 `easyimage`（默认）/ `r2` / `oss`，后两者走 S3 兼容 API（boto3，懒加载可选依赖） | EasyImage 没有公网直链语义，而这里必须产出「外部能 GET 的地址」。见下方「图床配置」 |
 | **URL 必须 percent-encode** | `urllib.parse.quote(safe=":/?#[]@!$&'()*+,;=")` | 官方明确警告：不编码会报 `InvalidFile.DownloadFailed`。用户的课件文件名几乎都是中文+空格 |
 | **三步状态机** | 提交 → 轮询 → 下载；轮询**用 GET**（官方 Python 示例是 POST，已用 GET 实测兼容） | 长音频异步返回，避免单连接长挂 |
 | **⚠ 整体成功但子任务失败** | 单独检查 `results[].subtask_status` | 官方明确：整体 `SUCCEEDED` 时子任务**仍可能 `FAILED`**。不查就会拿着一个不存在的 URL 去下载 |
@@ -275,6 +276,50 @@ qwen-audio-3.1-asr-flash-filetrans   Qwen-Audio，异步
 > ⚠ **开了说话人分离后，官方建议音频不超过 2 小时**，否则可能失败或超时
 > （`diarization_enabled` 本身仅支持**单声道**）。
 > `speaker_count` 只是「尽量输出这个人数」的提示，**不保证**一定输出。
+
+#### 图床配置：给 DashScope 提供音频公网 URL
+
+DashScope 不接受文件上传，所以音频必须先变成一个 **DashScope 服务端能直接 GET 的 URL**。
+三条路，在「设置 → 图床」里切 `provider` 即可：
+
+| provider | 填什么 | 说明 |
+|---|---|---|
+| `easyimage`（默认） | API URL + Token | 传统 multipart 图床 |
+| `r2` | bucket + endpoint + 密钥 | Cloudflare R2，**出网流量永久免费** |
+| `oss` | bucket + endpoint + 密钥 | 阿里云 OSS，与百炼同云时拉取最快 |
+
+**选 R2 还是 OSS？**
+
+- **R2**：10 GB/月存储免费，**Egress 完全免费**（它最大的卖点）。
+  endpoint = `https://<AccountID>.r2.cloudflarestorage.com`（AccountID 在 R2 控制台右侧）。
+- **OSS**：出网按量计费（几 MB 音频≈分文不取），但 **DashScope 服务器在阿里云境内**，
+  拉同云 OSS 是内网速度，比跨境拉 R2 稳。endpoint = `https://oss-cn-<地域>.aliyuncs.com`。
+
+> 音频只有几 MB，**成本上两者都不用担心**；要纠结就按「拉取稳定性」选 OSS。
+
+配置步骤（GUI「设置 → 图床」，把 Provider 敲成 `r2` 或 `oss`，S3 字段组会自动亮起）：
+
+```
+provider           = oss              # 或 r2
+bucket             = 你的桶名
+endpoint           = https://oss-cn-beijing.aliyuncs.com
+region             = cn-beijing       # 建议与百炼同区
+access_key_id      = xxx
+access_key_secret  = xxx
+public_base_url    = https://<bucket>.oss-cn-beijing.aliyuncs.com
+presign_seconds    = 3600
+```
+
+> ⚠ **桶必须外部可读**，否则 DashScope 拉到的是 403 / `InvalidFile.DownloadFailed`：
+> - OSS：把对象 ACL 设成 public-read，或用上面的 `public_base_url` + 公开读
+> - R2：给 bucket 开 **Public Development URL**（`https://pub-xxxx.r2.dev`）填进 `public_base_url`
+> - **不想开公读**：把 `presign_seconds` 设成 3600，走带签名的临时直链（私有桶也能用，更安全）
+
+密钥也可以走环境变量（不写进 config.json）：`OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET`
+（R2 对应 `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY`）。
+
+> boto3 是**可选依赖**，只 r2/oss 用得到。不装也不影响 AI 封面和 easyimage 图床——
+> 需要时程序会提示 `pip install boto3`。
 
 | 改动 | 内容 | 为什么改 |
 |------|------|----------|

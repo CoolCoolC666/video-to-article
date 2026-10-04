@@ -4,6 +4,8 @@ import os
 import re
 import time
 import base64
+import hashlib
+import urllib.parse
 from pathlib import Path
 from typing import Any, Optional
 
@@ -11,6 +13,8 @@ import requests
 
 from .blog import extract_frontmatter_title, replace_frontmatter_field, split_frontmatter
 from .logging_config import configure_logging
+from .text_utils import import_required
+
 logger = configure_logging()
 
 
@@ -785,10 +789,23 @@ def poll_modelscope_task(base_url: str, api_key: str, task_id: str, cover_config
 
 
 def upload_image_to_host(image_path: Path, image_host_config: dict) -> dict:
-    provider = image_host_config.get("provider", "easyimage")
-    if provider != "easyimage":
-        raise ValueError(f"不支持的图床提供商: {provider}")
-    return upload_to_easyimage(image_path, image_host_config)
+    """按 image_host.provider 分发到对应图床/对象存储。
+
+    2026-10-04 起支持三种：
+      easyimage 传统 multipart 图床（默认）
+      r2        Cloudflare R2（S3 兼容，出网免费）
+      oss       阿里云 OSS（S3 兼容，与百炼同云时拉取最快）
+    后两者是 DashScope 异步 ASR 的**音频中转**通道 —— 它不接受文件上传，
+    必须先拿到一个公网 URL。
+    """
+    provider = str(image_host_config.get("provider", "easyimage") or "easyimage").lower()
+    if provider == "easyimage":
+        return upload_to_easyimage(image_path, image_host_config)
+    if provider in S3_PROVIDER_DEFAULTS:
+        return upload_to_s3_compatible(image_path, image_host_config, provider)
+    raise ValueError(
+        f"不支持的图床提供商: {provider}（可选: easyimage / r2 / oss）"
+    )
 
 
 def prepare_cover_reference(
@@ -1153,6 +1170,145 @@ def upload_to_easyimage(image_path: Path, image_host_config: dict) -> dict:
         "url": image_url,
         "response": payload,
     }
+
+
+# ============ S3 兼容对象存储（Cloudflare R2 / 阿里云 OSS）============
+# 两者都提供 S3 兼容 API，所以只有 endpoint / 签名方式不同，共用一套实现。
+# 用途：DashScope 异步 ASR 硬性要求音频是**公网 URL**，需要中转上传。
+# 之所以不做成 EasyImage 那种 multipart：EasyImage 没有公网直链语义，
+# 而这里必须产出一个能在浏览器/服务端直接 GET 的地址。
+
+S3_PROVIDER_DEFAULTS = {
+    # R2：endpoint 必须带 Account ID；region 固定 auto
+    "r2": {"region": "auto", "sig_version": "s3v4", "addressing": "path"},
+    # OSS：endpoint 按地域拼；用 v2 签名（v4 需要 x-oss- 附加参数，跨云更绕）
+    "oss": {"region": "", "sig_version": "s3", "addressing": "path"},
+}
+
+_S3_ENV_KEYS = {
+    "r2": ("R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"),
+    "oss": ("OSS_ACCESS_KEY_ID", "OSS_ACCESS_KEY_SECRET"),
+}
+
+
+def _s3_object_key(file_path: Path, prefix: str = "asr") -> str:
+    """生成**纯 ASCII** 的 object key。
+
+    ⚠ 不要把原始文件名直接塞进 key：用户的课件名几乎都是中文
+    （如「1.54美术论文的写作与评点.mp3」），一旦进了公网 URL 就得靠
+    percent-encode 兜底，任何一层漏掉都会变成 404 / InvalidFile。
+    所以 key 用「时间戳 + 内容哈希」，原名只放进 ContentDisposition
+    （仅在浏览器下载时显示，不参与寻址）。
+    """
+    digest = hashlib.sha256(str(file_path).encode("utf-8")).hexdigest()[:10]
+    ext = (file_path.suffix or "").lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,8}", ext or ""):
+        ext = ".bin"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return f"{prefix.strip('/')}/{stamp}-{digest}{ext}"
+
+
+def upload_to_s3_compatible(file_path: Path, image_host_config: dict, provider: str) -> dict:
+    """上传到 Cloudflare R2 或阿里云 OSS，返回公网可读 URL。"""
+    defaults = S3_PROVIDER_DEFAULTS.get(provider)
+    if defaults is None:
+        raise ValueError(f"未知的对象存储提供商: {provider}")
+
+    bucket = str(image_host_config.get("bucket") or "").strip()
+    endpoint = str(image_host_config.get("endpoint") or "").strip().rstrip("/")
+    if not bucket:
+        raise ValueError(f"{provider} 需要 image_host.bucket（桶名）")
+    if not endpoint:
+        raise ValueError(
+            f"{provider} 需要 image_host.endpoint：\n"
+            + (
+                "  · R2  = https://<AccountID>.r2.cloudflarestorage.com"
+                "（AccountID 在 R2 控制台右侧）\n"
+                "  · OSS = https://oss-cn-<地域>.aliyuncs.com"
+                "（地域要和你的百炼同区，如 cn-beijing）"
+            )
+        )
+
+    env_id, env_secret = _S3_ENV_KEYS[provider]
+    access_key = resolve_secret(
+        image_host_config, "access_key_id", "access_key_id_env", env_id
+    )
+    secret_key = resolve_secret(
+        image_host_config, "access_key_secret", "access_key_secret_env", env_secret
+    )
+    if not access_key or not secret_key:
+        raise ValueError(
+            f"{provider} 需要 AccessKey。在 config.json 的 image_host 填 "
+            f"access_key_id / access_key_secret，或设环境变量 {env_id} / {env_secret}。"
+        )
+
+    boto3 = import_required("boto3", "boto3")
+    # ⚠ boto3/botocore 必须是**懒加载**：它们是可选依赖（只 r2/oss 用得到），
+    # 顶层 import 会让没装 boto3 的人连 AI 封面都一起用不了。
+    from botocore.config import Config
+
+    region = str(image_host_config.get("region") or defaults["region"] or "").strip()
+
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region or "us-east-1",
+        config=Config(
+            signature_version=defaults["sig_version"],
+            s3={"addressing_style": defaults["addressing"]},
+        ),
+    )
+
+    key = _s3_object_key(file_path, str(image_host_config.get("key_prefix") or "asr"))
+    extra_args = {
+        # ContentType 必填：否则下载时浏览器按 application/octet-stream 处置
+        "ContentType": mimetypes.guess_type(str(file_path))[0] or "application/octet-stream",
+        # 原名只做展示用，不参与寻址
+        "ContentDisposition": f'attachment; filename="{_ascii_fallback(file_path.name)}"',
+    }
+    if image_host_config.get("acl"):
+        # R2 不认 ACL，传了会报 AccessControlListNotSupportedError
+        if provider != "r2":
+            extra_args["ACL"] = str(image_host_config["acl"])
+
+    client.upload_file(str(file_path), bucket, key, ExtraArgs=extra_args)
+
+    # ① 显式配置的公网前缀优先（可用自定义域名 / CDN 域名）
+    base = str(image_host_config.get("public_base_url") or "").strip().rstrip("/")
+    presign_seconds = int(image_host_config.get("presign_seconds") or 0)
+    if base:
+        url = f"{base}/{key}"
+    elif presign_seconds > 0:
+        # ② 私有桶：生成带签名的直链，DashScope 服务端照样能 GET
+        url = client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=presign_seconds,
+        )
+    else:
+        url = f"{endpoint}/{bucket}/{key}"
+
+    if not presign_seconds and not base:
+        logger.info(
+            f"已上传到 {provider}，用「endpoint/bucket/key」拼了公网直链。"
+            "若桶不是公开读，DashScope 会拉不到 —— "
+            "可改配 public_base_url（推荐）或把 presign_seconds 设成 3600。"
+        )
+
+    return {
+        "success": True,
+        "provider": provider,
+        "url": url,
+        "bucket": bucket,
+        "key": key,
+    }
+
+
+def _ascii_fallback(name: str) -> str:
+    """ContentDisposition 头只能带 ASCII，非 ASCII 部分用转义。"""
+    return urllib.parse.quote(str(name), safe="")
 
 
 def resolve_cover_mode(

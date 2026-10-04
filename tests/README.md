@@ -60,6 +60,6 @@ Get-ChildItem tests\smoke_*.py | ForEach-Object {
 | `smoke_xf_e2e.py` | xf_asr 端到端 dispatch（音频 → transcribe_audio → xf_asr 主入口）+ `__all__` re-export 校验 |
 | `smoke_funasr_speaker.py` | FunASR CAM++ 模型解析 / sentence_info 格式化 / 富标签剥离 |
 | `smoke_custom_post_asr.py` | 自定义 POST 云端识别：协议契约、切段阈值、跨段偏移、9 类错误码、**base 自动拼路径 + 已填完整路径不重复拼**、请求头文件解析、凭证双来源、旧名 `minimax_asr` 兼容、五处注册点 |
-| `smoke_dashscope_asr.py` | **DashScope 异步**（2026-10-04 新增，20 组）：端点拼接、提交体字段、**中文/空格 URL 编码**、`parameters` 条件分支（`language_hints` 只 paraformer / 人数越界不下发）、轮询状态机（GET）、**整体 SUCCEEDED 但子任务 FAILED 会被拦住**、内联结果兜底、超时、官方 `transcripts[].sentences[]` 归一 + **毫秒转秒**、分风格切段阈值、没配图床的可操作提示 |
+| `smoke_dashscope_asr.py` | **DashScope 异步**（2026-10-04 新增，28 组）：端点拼接、提交体字段、**中文/空格 URL 编码**、`parameters` 条件分支（`language_hints` 只 paraformer / 人数越界不下发）、轮询状态机（GET）、**整体 SUCCEEDED 但子任务 FAILED 会被拦住**、内联结果兜底、超时、官方 `transcripts[].sentences[]` 归一 + **毫秒转秒**、分风格切段阈值、**占位域名识别（9 个占位 + 7 个真地址双向，防误杀）**、**S3 object key 恒为 ASCII**、R2/OSS 缺配置一次列全、**boto3 确认懒加载（不拖累封面）** |
 | `smoke_llm_settings.py` | LLM 多档案 + 模型自动发现：协议/厂商两行对齐、Model 可编辑下拉 + ⟳ 抓取、档案增删改、档案隔离 |
 | `smoke_bilibili_parse.py` | B 站引用解析（2026-10-03 新增）：严格语法、**av↔BV 本地互转**（锚点 `av170001 ↔ BV17x411w7KC`）、优先级与消费区间、b23 短链展开、av 形式 URL 取字幕 |

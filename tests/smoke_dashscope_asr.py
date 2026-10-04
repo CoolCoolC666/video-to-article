@@ -11,6 +11,7 @@
 """
 import os
 import sys
+import pathlib
 import tempfile
 
 sys.path.insert(0, "src")
@@ -472,6 +473,102 @@ def test_audio_url_skips_image_host():
     print("OK 8: 显式填 audio_url 时完全跳过图床（图床是垃圾配置也不影响）")
 
 
+# ----------------------------------------- 9. S3 兼容对象存储（R2 / OSS）
+def test_s3_object_key_is_ascii():
+    """object key 绝不能含中文 —— 用户的课件名几乎全是中文。
+
+    一旦进了公网 URL 就得靠 percent-encode 兜底，任何一层漏掉都是 404 /
+    InvalidFile.DownloadFailed。所以 key 用时间戳+哈希，原名只做展示。
+    """
+    from video_to_article.cover import _s3_object_key
+
+    class P:
+        def __init__(self, name):
+            self._s = name
+
+        def __str__(self):
+            return self._s
+
+        @property
+        def suffix(self):
+            return self._s[self._s.rfind("."):] if "." in self._s else ""
+
+        @property
+        def name(self):
+            return self._s
+
+    for name in ("1.54美术论文的写作与评点.mp3", "第 1 课 - 色彩 (一).mp3", "a.mp3"):
+        key = _s3_object_key(P(name))
+        assert key.isascii(), f"key 含非 ASCII: {key!r} (原名 {name!r})"
+        assert key.startswith("asr/")
+        assert key.endswith(".mp3"), key
+    # 同一路径两次生成应不同（时间戳或路径不同）—— 只验格式稳定即可
+    assert _s3_object_key(P("x.mp3"), "custom/prefix").startswith("custom/prefix/")
+    print("OK 9a: S3 object key 恒为纯 ASCII（中文文件名不会污染公网 URL）")
+
+
+def test_s3_missing_config_guided():
+    p = os.path.join(tempfile.gettempdir(), "smoke_ds_audio3.mp3")
+
+    def _fresh():
+        with open(p, "wb") as f:
+            f.write(b"ID3" + b"\0" * 512)
+
+    # r2 什么都没填 —— 要一次说清缺哪些，而不是逐个字段报
+    _fresh()
+    try:
+        cp.upload_audio_for_public_url(cp.Path(p), {"provider": "r2"})
+        raise SystemExit("应该抛错但没抛")
+    except RuntimeError as e:
+        msg = str(e)
+        for field in ("bucket", "endpoint", "access_key_id", "access_key_secret"):
+            assert field in msg, f"应点名缺 {field}: {msg}"
+        assert "r2.cloudflarestorage.com" in msg, "应直接给出 endpoint 写法"
+        assert "oss-cn-" in msg, "应顺带说明 OSS 怎么写"
+    print("OK 9b: R2/OSS 缺配置时一次列全缺失项 + 直接给出 endpoint 写法")
+
+    # endpoint 是占位符
+    _fresh()
+    try:
+        cp.upload_audio_for_public_url(cp.Path(p), {
+            "provider": "oss", "bucket": "b", "endpoint": "https://你的OSS域名",
+            "access_key_id": "k", "access_key_secret": "s",
+        })
+        raise SystemExit("应该抛错但没抛")
+    except RuntimeError as e:
+        assert "占位符" in str(e), str(e)
+
+    # 未知 provider
+    _fresh()
+    try:
+        cp.upload_audio_for_public_url(cp.Path(p), {"provider": "dropbox"})
+        raise SystemExit("应该抛错但没抛")
+    except ValueError as e:
+        assert "easyimage" in str(e) and "r2" in str(e) and "oss" in str(e), str(e)
+    finally:
+        if os.path.exists(p):
+            os.unlink(p)
+    print("OK 9c: endpoint 占位符 / 未知 provider 都被挡住并说清可选值")
+
+
+def test_s3_dispatch_exists():
+    """upload_image_to_host 要认 r2/oss，且 boto3 是懒加载的。"""
+    from video_to_article import cover
+
+    assert "r2" in cover.S3_PROVIDER_DEFAULTS
+    assert "oss" in cover.S3_PROVIDER_DEFAULTS
+    # R2 不认 ACL（传了会 AccessControlListNotSupportedError）
+    assert cover.S3_PROVIDER_DEFAULTS["r2"]["region"] == "auto"
+    assert cover.S3_PROVIDER_DEFAULTS["oss"]["region"] == ""
+    # boto3/botocore 绝不能是顶层 import —— 否则没装 boto3 的人
+    # 连 AI 封面都用不了（cover.py 是封面主模块）
+    src = pathlib.Path(cover.__file__).read_text(encoding="utf-8")
+    head = src.split("def ")[0]
+    assert "import boto3" not in head, "boto3 不该在模块顶层 import"
+    assert "from botocore" not in head, "botocore 不该在模块顶层 import"
+    print("OK 9d: r2/oss 分发就位 + boto3 确认为懒加载（不拖累封面功能）")
+
+
 def main():
     test_endpoint_building()
     test_submit_body()
@@ -482,6 +579,9 @@ def main():
     test_image_host_guard()
     test_placeholder_detection()
     test_audio_url_skips_image_host()
+    test_s3_object_key_is_ascii()
+    test_s3_missing_config_guided()
+    test_s3_dispatch_exists()
     print()
     print("smoke_dashscope_asr: 全部通过 ✓")
 

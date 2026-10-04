@@ -198,6 +198,14 @@ _PROFILE_SPECS: dict[str, ProfileSpec] = {
             "url_json_path": d.host_url_path.text().strip() or "url",
             "timeout_seconds": int(d.host_timeout.value()),
             "extra_fields": d.host_extra.toPlainText().strip(),
+            # S3 系（r2 / oss）—— 2026-10-04，DashScope 音频中转
+            "bucket": d.host_bucket.text().strip(),
+            "endpoint": d.host_endpoint.text().strip(),
+            "region": d.host_region.text().strip(),
+            "access_key_id": d.host_ak_id.text().strip(),
+            "access_key_secret": d.host_ak_secret.text().strip(),
+            "public_base_url": d.host_public_base.text().strip(),
+            "presign_seconds": int(d.host_presign.value()),
         },
         apply=lambda d, p: d._apply_host_profile_to_ui(p),
         combo_fmt=lambda p: (
@@ -412,8 +420,20 @@ class SettingsDialog(ProfileMixin, QDialog):
             ("host_token_field", "token_field"),
             ("host_file_field", "file_field"),
             ("host_url_path", "url_json_path"),
+            # S3 系（r2 / oss）—— 2026-10-04
+            ("host_bucket", "bucket"),
+            ("host_endpoint", "endpoint"),
+            ("host_region", "region"),
+            ("host_ak_id", "access_key_id"),
+            ("host_ak_secret", "access_key_secret"),
+            ("host_public_base", "public_base_url"),
         ):
             getattr(self, attr).setText(str(prof.get(key) or ""))
+        try:
+            self.host_presign.setValue(int(prof.get("presign_seconds") or 0))
+        except (TypeError, ValueError):
+            self.host_presign.setValue(0)
+        self._on_host_provider_changed()
         try:
             self.host_timeout.setValue(int(prof.get("timeout_seconds") or 180))
         except (TypeError, ValueError):
@@ -463,6 +483,16 @@ class SettingsDialog(ProfileMixin, QDialog):
             visible = show_all or (engine == current)
             for w in widgets:
                 w.setVisible(visible)
+
+    def _on_host_provider_changed(self) -> None:
+        """provider 打成 r2/oss 时才亮出 S3 字段组。
+
+        保持 host_provider 是自由文本框（档案机制按 .text() 取值，
+        改 QComboBox 会牵动 spec/apply/save/load 四处），靠 textChanged
+        做识别 —— 用户一敲 r2 就自动切换，不用先去下拉里选。
+        """
+        is_s3 = str(self.host_provider.text() or "").strip().lower() in ("r2", "oss")
+        self._host_s3_box.setVisible(is_s3)
 
     def _on_cp_style_changed(self) -> None:
         """切 API 风格：启用/禁用该风格专属的字段，并刷新端点预览。"""
@@ -1473,6 +1503,70 @@ class SettingsDialog(ProfileMixin, QDialog):
         form.addRow("url_json_path", self.host_url_path)
         form.addRow("timeout_seconds", self.host_timeout)
         form.addRow("extra_fields (JSON)", self.host_extra)
+
+        # === 2026-10-04：S3 兼容对象存储（R2 / OSS）===
+        # 用途是给 DashScope 异步 ASR 做音频中转 —— 它不接受文件上传，
+        # 音频必须先变成公网 URL。easyimage 也能传，但没有公网直链语义。
+        self.host_provider.setPlaceholderText("easyimage（默认）/ r2 / oss")
+        self.host_provider.setToolTip(
+            "easyimage  传统 multipart 图床（Chevereto / 自建），填下面的 API URL + Token\n"
+            "r2         Cloudflare R2（S3 兼容，**出网流量永久免费**）\n"
+            "oss        阿里云 OSS（S3 兼容，与百炼同云时 DashScope 拉取最快）\n\n"
+            "切成 r2 / oss 后，下面这组字段才会启用。"
+        )
+        s3_box = QGroupBox("S3 兼容对象存储（r2 / oss 用）")
+        s3_form = QFormLayout(s3_box)
+        self.host_bucket = QLineEdit()
+        self.host_bucket.setPlaceholderText("桶名，如 my-audio")
+        self.host_endpoint = QLineEdit()
+        self.host_endpoint.setPlaceholderText(
+            "r2  = https://<AccountID>.r2.cloudflarestorage.com\n"
+            "oss = https://oss-cn-<地域>.aliyuncs.com（建议与百炼同区）"
+        )
+        self.host_region = QLineEdit()
+        self.host_region.setPlaceholderText("oss 填 cn-beijing 之类；r2 留空即可（自动 auto）")
+        self.host_ak_id = QLineEdit()
+        self.host_ak_id.setPlaceholderText("AccessKeyId（R2 叫 API Token ID）")
+        self.host_ak_secret = QLineEdit()
+        self.host_ak_secret.setEchoMode(QLineEdit.Password)
+        self.host_ak_secret.setPlaceholderText("AccessKeySecret / R2 Secret Key")
+        self.host_public_base = QLineEdit()
+        self.host_public_base.setPlaceholderText(
+            "公网访问前缀（可选）。r2 用 https://pub-xxxx.r2.dev；\n"
+            "oss 用 https://<bucket>.oss-cn-<region>.aliyuncs.com。留空则按 endpoint 拼"
+        )
+        self.host_presign = QSpinBox()
+        self.host_presign.setRange(0, 86400)
+        self.host_presign.setSuffix(" 秒")
+        self.host_presign.setToolTip(
+            "0 = 用上面那个公网直链（要求桶**公开可读**）。\n"
+            "大于 0 = 生成带签名的临时直链（私有桶也能用，更安全）。\n"
+            "建议 3600：足够 DashScope 拉完，又不会长期暴露。"
+        )
+        s3_form.addRow("bucket", self.host_bucket)
+        s3_form.addRow("endpoint", self.host_endpoint)
+        s3_form.addRow("region", self.host_region)
+        s3_form.addRow("access_key_id", self.host_ak_id)
+        s3_form.addRow("access_key_secret", self.host_ak_secret)
+        s3_form.addRow("public_base_url", self.host_public_base)
+        s3_form.addRow("签名有效期", self.host_presign)
+        form.addRow(s3_box)
+        self._host_s3_box = s3_box
+        self.host_provider.textChanged.connect(self._on_host_provider_changed)
+
+        host_tip = QLabel(
+            "💡 图床/对象存储的用途：AI 封面出图 + 给 DashScope 异步 ASR 中转音频。\n"
+            "  · 封面用：传 PNG，拿到 URL 就能生图\n"
+            "  · DashScope 用：它**不接受文件上传**，音频必须先变成公网 URL，\n"
+            "    所以这里既要能传 mp3，也必须能产出**外部可 GET 的直链**\n"
+            "  · 选 r2 / oss 时别忘了让桶**公网可读**（r2 配 public bucket 或 r2.dev 域名，\n"
+            "    oss 把 ACL 设 public-read），否则 DashScope 会拉不到；\n"
+            "    不想开公读就把上面「签名有效期」设成 3600，走临时签名直链。"
+        )
+        host_tip.setWordWrap(True)
+        host_tip.setStyleSheet("color: #666; font-size: 11px;")
+        form.addRow(host_tip)
+
         self.tabs.addTab(_scroll_page(page), "图床")
 
     def load_from_disk(self) -> None:
@@ -1653,6 +1747,18 @@ class SettingsDialog(ProfileMixin, QDialog):
         self.host_file_field.setText(str(host.get("file_field") or "image"))
         self.host_url_path.setText(str(host.get("url_json_path") or "url"))
         self.host_timeout.setValue(int(host.get("timeout_seconds") or 180))
+        # S3 系字段（2026-10-04：DashScope 音频中转）
+        self.host_bucket.setText(str(host.get("bucket") or ""))
+        self.host_endpoint.setText(str(host.get("endpoint") or ""))
+        self.host_region.setText(str(host.get("region") or ""))
+        self.host_ak_id.setText(str(host.get("access_key_id") or ""))
+        self.host_ak_secret.setText(str(host.get("access_key_secret") or ""))
+        self.host_public_base.setText(str(host.get("public_base_url") or ""))
+        try:
+            self.host_presign.setValue(int(host.get("presign_seconds") or 0))
+        except (TypeError, ValueError):
+            self.host_presign.setValue(0)
+        self._on_host_provider_changed()
         extra = host.get("extra_fields") or {}
         try:
             self.host_extra.setPlainText(json.dumps(extra, ensure_ascii=False, indent=2) if extra else "{}")
@@ -1805,6 +1911,14 @@ class SettingsDialog(ProfileMixin, QDialog):
                 "url_json_path": self.host_url_path.text().strip() or "url",
                 "timeout_seconds": self.host_timeout.value(),
                 "extra_fields": extra_fields,
+                # S3 兼容对象存储（r2 / oss）—— DashScope 音频中转用
+                "bucket": self.host_bucket.text().strip(),
+                "endpoint": self.host_endpoint.text().strip(),
+                "region": self.host_region.text().strip(),
+                "access_key_id": self.host_ak_id.text().strip(),
+                "access_key_secret": self.host_ak_secret.text().strip(),
+                "public_base_url": self.host_public_base.text().strip(),
+                "presign_seconds": self.host_presign.value(),
                 # 2026-10-04：图床配置档案
                 **self._profile_updates(self._spec("host")),
             },

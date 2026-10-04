@@ -607,12 +607,15 @@ def _transcribe_one(
 _IMAGE_HOST_MISSING = (
     "DashScope 模式需要音频的公网 URL，但没配置图床。\n"
     "三选一：\n"
-    "  ① 到「设置 → 图床」填好 api_url / token（可先点右下「管理…」旁的\n"
-    "     启用图床上传试一下能否传 mp3）\n"
-    "  ② 或自己把 mp3 传到任意公网可访问的地方，把直链填进 config 的\n"
-    "     transcribe.custom_post.audio_url（跳过图床）\n"
-    "  ③ 或改用「OpenAI 兼容」风格 + 不传音频的纯文本服务"
+    "  ① 到「设置 → 图床」把 provider 切成 r2（Cloudflare，出网免费）\n"
+    "     或 oss（阿里云，与百炼同云拉取最快），填 bucket/endpoint/密钥\n"
+    "  ② 保持 easyimage，填好真实 api_url + token\n"
+    "  ③ 自己把 mp3 传到任意公网可访问的地方，把直链填进「音频直链」输入框"
 )
+
+# 与 cover._S3_ENV_KEYS 保持一致（那边是上传侧，这里是校验侧的提示文案）
+_S3_ENV_ID = {"r2": "R2_ACCESS_KEY_ID", "oss": "OSS_ACCESS_KEY_ID"}
+_S3_ENV_SECRET = {"r2": "R2_SECRET_ACCESS_KEY", "oss": "OSS_ACCESS_KEY_SECRET"}
 
 
 def _placeholder_host_hint(url: str) -> str:
@@ -672,39 +675,92 @@ def _looks_like_placeholder_url(url: str) -> bool:
 
 
 def upload_audio_for_public_url(audio_path: Path, image_host_config: dict) -> str:
-    """把音频借图床传成公网 URL（DashScope 必需）。
+    """把音频借图床/对象存储传成公网 URL（DashScope 必需）。
 
-    复用 `cover.upload_image_to_host`（本质是通用 multipart 上传，EasyImage 图床
-    本身能收任意文件类型，mime 由 mimetypes 猜）。
+    DashScope 的文件级 ASR **不接受文件上传**，音频必须是一个 DashScope
+    服务端能直接 GET 的公网 URL，所以这里做中转。两条路：
+      ① provider=easyimage  传统 multipart 图床（要配 api_url + token）
+      ② provider=r2 / oss  S3 兼容对象存储（要配 bucket + endpoint + AK/SK）
+    ② 是 2026-10-04 新增的：R2 出网免费，OSS 与百炼同云时拉取最快。
     """
-    api_url = str((image_host_config or {}).get("api_url") or "").strip()
-    if not image_host_config or not api_url:
-        raise RuntimeError(_IMAGE_HOST_MISSING)
-    if _looks_like_placeholder_url(api_url):
-        # ⚠ 不要把原始 URL 原样打出来——那正是报错的根源，重复一遍只会
-        # 让用户对着同一个看不懂的 punycode 字符串发呆。只说清「哪里没填」。
-        host_hint = _placeholder_host_hint(api_url)
-        raise RuntimeError(
-            "DashScope 模式需要音频的公网 URL，但图床地址还是**模板里的占位符**，"
-            "从没换成真实域名。\n"
-            f"当前 host 部分：{host_hint}\n\n"
-            "这不是网络问题 —— 那个中文占位符被自动转成了 punycode，"
-            "报出来是 'Failed to resolve xn--...'，看着像 DNS 故障，其实是没填。\n\n"
-            "三选一：\n"
-            "  ① 到「设置 → 图床」把 api_url 换成你的**真实图床地址**\n"
-            "     （EasyImage 系的接口形如 https://你的域名/api/index.php），\n"
-            "     并确认已启用\n"
-            "  ② 自己把 mp3 传到任意公网可访问处，把直链填进 config 的\n"
-            "     transcribe.custom_post.audio_url（跳过图床）\n"
-            "  ③ 改用「OpenAI 兼容」风格 + 不传音频的纯文本服务"
+    cfg = image_host_config or {}
+    provider = str(cfg.get("provider") or "easyimage").strip().lower()
+    api_url = str(cfg.get("api_url") or "").strip()
+
+    # ⚠ 未知 provider 必须在这里就拦：否则像 "cloudflare" / "s3" 这类别名
+    # 会静默落进 easyimage 分支，最后报「没配置图床」——
+    # 提示指向完全错误的方向（用户会去填 api_url，而真正要填的是 bucket/AK）。
+    if provider not in ("easyimage", "r2", "oss"):
+        raise ValueError(
+            f"不支持的图床提供商: {provider!r}\n"
+            "可选值：\n"
+            "  easyimage  传统 multipart 图床（填 API URL + Token）\n"
+            "  r2         Cloudflare R2（S3 兼容，出网流量永久免费）\n"
+            "  oss        阿里云 OSS（S3 兼容，与百炼同云时拉取最快）\n"
+            "注意：r2 / oss 要填的是 bucket + endpoint + 密钥，**不是** API URL。"
         )
+
+    if provider in ("r2", "oss"):
+        # S3 系不靠 api_url，取而代之的是 bucket/endpoint/AK 三件套
+        missing = [
+            name for name, val in (
+                ("bucket", cfg.get("bucket")),
+                ("endpoint", cfg.get("endpoint")),
+                ("access_key_id", cfg.get("access_key_id") or os.getenv(_S3_ENV_ID[provider])),
+                ("access_key_secret", cfg.get("access_key_secret")
+                 or os.getenv(_S3_ENV_SECRET[provider])),
+            ) if not str(val or "").strip()
+        ]
+        if missing:
+            raise RuntimeError(
+                f"{'Cloudflare R2' if provider == 'r2' else '阿里云 OSS'} 模式缺少配置："
+                f"{'、'.join(missing)}\n\n"
+                "在「设置 → 图床」把 provider 切成 "
+                f"{provider}，然后填这几项（或在 config.json 的 image_host 块）：\n"
+                + (
+                    "  · R2  endpoint  = https://<AccountID>.r2.cloudflarestorage.com\n"
+                    "  · OSS endpoint  = https://oss-cn-<地域>.aliyuncs.com\n"
+                    "     （地域建议与你的百炼同区，如 cn-beijing —— 跨云拉取会慢）\n"
+                    "  · 两者都要填 bucket 名\n"
+                    "  · 密钥可填 access_key_id/access_key_secret，"
+                    f"或设环境变量 {_S3_ENV_ID[provider]} / {_S3_ENV_SECRET[provider]}\n\n"
+                    "⚠ 别忘了让桶**公网可读**（R2 配 public bucket / r2.dev 域名，"
+                    "OSS 配 public-read），否则 DashScope 拉不到；"
+                    "或把 presign_seconds 设成 3600 走签名直链。"
+                )
+            )
+        if _looks_like_placeholder_url(str(cfg.get("endpoint"))):
+            raise RuntimeError(
+                f"{provider} 的 endpoint 还是模板占位符，没换成真实地址。\n"
+                f"当前 host 部分：{_placeholder_host_hint(str(cfg.get('endpoint')))}"
+            )
+    else:
+        if not cfg or not api_url:
+            raise RuntimeError(_IMAGE_HOST_MISSING)
+        if _looks_like_placeholder_url(api_url):
+            # ⚠ 不要把原始 URL 原样打出来——那正是报错的根源，重复一遍只会
+            # 让用户对着同一个看不懂的 punycode 字符串发呆。只说清「哪里没填」。
+            host_hint = _placeholder_host_hint(api_url)
+            raise RuntimeError(
+                "DashScope 模式需要音频的公网 URL，但图床地址还是**模板里的占位符**，"
+                "从没换成真实域名。\n"
+                f"当前 host 部分：{host_hint}\n\n"
+                "这不是网络问题 —— 那个中文占位符被自动转成了 punycode，"
+                "报出来是 'Failed to resolve xn--...'，看着像 DNS 故障，其实是没填。\n\n"
+                "三选一：\n"
+                "  ① 到「设置 → 图床」填真实域名，或把 provider 切成 r2 / oss\n"
+                "     （对象存储，配 bucket + endpoint + AK/SK，R2 出网还免费）\n"
+                "  ② 自己把 mp3 传到任意公网可访问处，把直链填进「音频直链」输入框\n"
+                "  ③ 改用「OpenAI 兼容」风格 + 不传音频的纯文本服务"
+            )
+
     from ..cover import upload_image_to_host
 
-    result = upload_image_to_host(audio_path, image_host_config)
+    result = upload_image_to_host(audio_path, cfg)
     url = str((result or {}).get("url") or "")
     if not url:
-        raise RuntimeError(f"图床上传成功但没拿到 URL: {result}")
-    logger.info(f"音频已借图床转为公网 URL: {url}")
+        raise RuntimeError(f"上传成功但没拿到 URL: {result}")
+    logger.info(f"音频已转为公网 URL（provider={provider}）")
     return url
 
 

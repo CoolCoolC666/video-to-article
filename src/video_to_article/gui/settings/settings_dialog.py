@@ -1061,10 +1061,11 @@ class SettingsDialog(ProfileMixin, QDialog):
             "  填错的话服务端只回英文\n"
             "  'current user api does not support asynchronous calls'，\n"
             "  完全看不出是少抄了后缀。\n\n"
-            "可直接填的异步模型名：\n"
-            "  qwen3-asr-flash-filetrans          Qwen3，长音频（推荐）\n"
-            "  qwen-audio-3.1-asr-flash-filetrans  Qwen-Audio\n"
-            "  paraformer-v2                       通用，支持 language_hints + 说话人分离\n\n"
+            "可直接填的异步模型名（以你手上官方文档为准，版本会更新）：\n"
+            "  qwen-audio-3.0-asr-flash-filetrans  Qwen-Audio，≤2GB/12h\n"
+            "  qwen3-asr-flash-filetrans           Qwen3，≤2GB/12h\n"
+            "  fun-asr                             Fun-ASR\n"
+            "  paraformer-v2                       仅北京地域\n\n"
             "OpenAI 兼容风格下这个字段被忽略（协议里 model 由程序固定为 asr-1.0）。"
         )
 

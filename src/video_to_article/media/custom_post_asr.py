@@ -855,6 +855,8 @@ _DASHSCOPE_SYNC_ONLY_MODELS = {
     "qwen3-asr-flash": "qwen3-asr-flash-filetrans",
     "qwen3-asr-flash-realtime": "qwen3-asr-flash-filetrans",
     "qwen3-asr-flash-latest": "qwen3-asr-flash-filetrans",
+    "qwen-audio-3.0-asr-flash": "qwen-audio-3.0-asr-flash-filetrans",
+    "fun-asr-flash": "fun-asr",
     "paraformer-realtime-v2": "paraformer-v2",
 }
 
@@ -877,6 +879,47 @@ def _reject_sync_only_model(model: str) -> None:
         "服务端只会回 'current user api does not support asynchronous calls'，"
         "看不出是这个原因。"
     )
+
+
+def _raise_dashscope_submit_error(resp, url: str, model: str) -> None:
+    """提交失败时抛错，并对「独享部署只支持同步」这句官方含义做展开。
+
+    官方「非即時語音辨識」文档原文：
+        如果您調用**獨享部署**的模型服務時收到報錯
+        `current user api does not support asynchronous calls`，
+        表示該部署僅支援同步調用，請將請求頭改為 `X-DashScope-Async: disable`。
+
+    ⚠ 这句报错容易被一律当成「模型名填错」，但官方给的是**部署形态**的解释：
+      端点形如 https://<自定义>.maas.aliyuncs.com/api/v1 或 qianwenaiapi.com
+      的都是**独享部署**（公共端点是 dashscope.aliyuncs.com）。
+      也就是说：模型名填对了，这句照样可能出现 —— 那是账号侧的部署配置问题，
+      程序改不了，只能去控制台看该部署是否开通了异步能力。
+    """
+    base = _extract_error(resp, url)
+    try:
+        blob = json.dumps(resp.json(), ensure_ascii=False).lower()
+    except Exception:
+        blob = (resp.text or "").lower()
+    if "asynchronous" in blob or "异步" in blob:
+        raise RuntimeError(
+            base
+            + "\n\n⚠ 这句报错的官方含义是：**当前这个部署只支持同步调用**"
+              "（不只是模型名的问题）。\n"
+              "  官方文档原文：「如果您调用独享部署的模型服务时收到报错"
+              "current user api does not support asynchronous calls，"
+              "表示该部署仅支持同步调用，请将请求头改为 X-DashScope-Async: disable」。\n\n"
+              "  你的端点形如自定义域名 / qianwenaiapi.com，属于**独享部署**"
+              "（公共端点是 dashscope.aliyuncs.com）。\n"
+              "  两种可能：\n"
+              "   ① 模型名填的是同步模型 → 换成 -filetrans 结尾的异步模型\n"
+              f"      （你当前填的是 {model}）\n"
+              "   ② 模型名没错，但**这个部署本身没开通异步能力** → 程序改不了，\n"
+              "      要去阿里云百炼控制台确认该部署是否支持异步转写\n\n"
+              "  确认办法：用同一个 Key 调公共端点 "
+              "https://dashscope.aliyuncs.com/api/v1 试一次，\n"
+              "  公共端点一定是支持异步的（前提是 Key 同地域）。"
+        )
+    raise RuntimeError(base)
 
 
 def _dashscope_submit(
@@ -905,7 +948,7 @@ def _dashscope_submit(
     if not model:
         raise RuntimeError(
             "DashScope 模式必须填模型名（如 paraformer-v2 / qwen3-asr-flash-filetrans / "
-            "qwen-audio-3.1-asr-flash-filetrans）。"
+            "qwen-audio-3.0-asr-flash-filetrans）。"
         )
     _reject_sync_only_model(model)
     # 官方明确警告：URL 含空格/中文必须先 percent-encode，
@@ -937,7 +980,7 @@ def _dashscope_submit(
         url, headers=_dashscope_headers(api_key, extra_headers), json=body, timeout=60
     )
     if resp.status_code != 200:
-        raise RuntimeError(_extract_error(resp, url))
+        _raise_dashscope_submit_error(resp, url, model)
     payload = resp.json()
     task_id = str(((payload or {}).get("output") or {}).get("task_id") or "")
     if not task_id:
@@ -1376,7 +1419,7 @@ def transcribe_audio_with_custom_post(audio_path: str, config: dict) -> str:
         if not model:
             raise RuntimeError(
                 "DashScope 模式必须填「模型名」（如 qwen3-asr-flash-filetrans / "
-                "qwen-audio-3.1-asr-flash-filetrans / paraformer-v2）。\n"
+                "qwen-audio-3.0-asr-flash-filetrans / paraformer-v2）。\n"
                 "在「设置 → 转写 → 自定义（POST）高级 → 模型名」填写。"
             )
         t0 = time.time()

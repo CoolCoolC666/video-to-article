@@ -674,6 +674,8 @@ def test_sync_only_model_rejected():
         ("qwen3-asr-flash", "qwen3-asr-flash-filetrans"),
         ("Qwen3-ASR-Flash", "qwen3-asr-flash-filetrans"),   # 大小写
         ("  qwen3-asr-flash  ", "qwen3-asr-flash-filetrans"),  # 空格
+        ("qwen-audio-3.0-asr-flash", "qwen-audio-3.0-asr-flash-filetrans"),
+        ("fun-asr-flash", "fun-asr"),
         ("paraformer-realtime-v2", "paraformer-v2"),
     ):
         s = use(FakeSession(post_script=[FakeResp(200, {"output": {"task_id": "t"}})]))
@@ -690,8 +692,8 @@ def test_sync_only_model_rejected():
         assert not s.posts, f"{bad!r} 应在发请求前就被拦下，却已发出 {len(s.posts)} 个请求"
 
     # 正确模型必须放行
-    for ok in ("qwen3-asr-flash-filetrans", "qwen-audio-3.1-asr-flash-filetrans",
-               "paraformer-v2", "某个将来新增的异步模型"):
+    for ok in ("qwen3-asr-flash-filetrans", "qwen-audio-3.0-asr-flash-filetrans",
+               "fun-asr", "paraformer-v2", "某个将来新增的异步模型"):
         s = use(FakeSession(post_script=[FakeResp(200, {"output": {"task_id": "t"}})]))
         try:
             _dashscope_submit(BASE, "K", ok, "https://x.com/a.mp3", "")
@@ -699,6 +701,40 @@ def test_sync_only_model_rejected():
             done()
         assert s.posts, f"{ok!r} 是合法异步模型，不该被拦"
     print("OK 12: 同步模型名（qwen3-asr-flash）发请求前拦下并指向 filetrans；异步模型放行")
+
+
+# ------- 12b: 「不支持异步」报错的官方含义是**部署形态**，不只模型名
+def test_dedicated_deployment_hint():
+    """这句报错极易被一律当成「模型名填错」，但官方给的是部署形态的解释：
+
+    「如果您调用独享部署的模型服务时收到报错
+      current user api does not support asynchronous calls，
+      表示该部署仅支持同步调用」
+
+    端点形如 <自定义>.maas.aliyuncs.com / qianwenaiapi.com 的都是**独享部署**
+    （公共端点是 dashscope.aliyuncs.com），异步能力由控制台决定，程序改不了。
+    所以提示必须同时给出「换模型」和「去控制台确认部署」两条路，
+    只说前者会让用户在换完模型后再次撞墙且更困惑。
+    """
+    from video_to_article.media.custom_post_asr import _raise_dashscope_submit_error
+
+    resp = FakeResp(403, {
+        "code": "InvalidApi",
+        "message": "current user api does not support asynchronous calls",
+    })
+    try:
+        _raise_dashscope_submit_error(resp, f"{BASE}/services/audio/asr/transcription",
+                                      "qwen3-asr-flash-filetrans")
+        raise SystemExit("应该抛错但没抛")
+    except RuntimeError as e:
+        msg = str(e)
+        # 两条路都要说
+        assert "独享部署" in msg, msg
+        assert "只支持同步" in msg, msg
+        assert "qwen3-asr-flash-filetrans" in msg, "应回显当前模型名供核对"
+        assert "控制台" in msg, "应指出「部署没开通异步」这条程序改不了的路"
+        assert "dashscope.aliyuncs.com" in msg, "应给出公共端点作为对照验证手段"
+    print("OK 12b: 「不支持异步」提示同时给出换模型 + 查部署两条路（不让人换完仍撞墙）")
 
 
 def main():
@@ -717,6 +753,7 @@ def main():
     test_host_field_groups_mutually_exclusive()
     test_credential_shape_warning()
     test_sync_only_model_rejected()
+    test_dedicated_deployment_hint()
     print()
     print("smoke_dashscope_asr: 全部通过 ✓")
 

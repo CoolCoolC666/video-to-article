@@ -278,13 +278,19 @@ fork **新增** `src/video_to_article/media/custom_post_asr.py`。最初是「Mi
 > `current user api does not support asynchronous calls`，**完全看不出是少抄了后缀**。
 > 程序已加提交前预检：填了同步模型会直接告诉你该用哪个（且**不会发出请求**，不白花钱）。
 
-异步风格下可用的模型名：
+异步风格下可用的模型名（**以你手上官方文档为准**，官方会更新版本号）：
 
 ```
-qwen3-asr-flash-filetrans          Qwen3，长音频（推荐）
-qwen-audio-3.1-asr-flash-filetrans  Qwen-Audio
-paraformer-v2                       通用，支持 language_hints + 说话人分离
+qwen-audio-3.0-asr-flash-filetrans   Qwen-Audio，≤2GB / 12h
+qwen3-asr-flash-filetrans            Qwen3，≤2GB / 12h
+fun-asr                              Fun-ASR
+paraformer-v2                        仅北京地域
 ```
+
+> ⚠ **如果换成异步模型名后仍然报 `current user api does not support asynchronous calls`**，
+> 那就不是模型名的问题了。官方文档的解释是：**当前这个部署只支持同步调用**。
+> 端点形如自定义域名 / `qianwenaiapi.com` 的属于**独享部署**（公共端点是
+> `dashscope.aliyuncs.com`）——独享部署是否开通异步能力由控制台决定，程序改不了。
 
 > ⚠ **开了说话人分离后，官方建议音频不超过 2 小时**，否则可能失败或超时
 > （`diarization_enabled` 本身仅支持**单声道**）。

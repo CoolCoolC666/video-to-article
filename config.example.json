@@ -1,13 +1,17 @@
 {
   "llm": {
-    "provider": "openai",
+    "protocol": "openai_chat",
+    "vendor": "openai",
+    "provider": "openai_chat",
     "api_key": "your-api-key-here",
     "base_url": "https://api.openai.com/v1",
     "model": "gpt-4o-mini",
     "temperature": 0.3,
     "max_tokens": 12000,
     "timeout_seconds": 180,
-    "max_retries": 3
+    "max_retries": 3,
+    "active_profile": "",
+    "profiles": []
   },
   "transcribe": {
     "model_size": "tiny",

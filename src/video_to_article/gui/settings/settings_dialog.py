@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -16,8 +18,11 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -44,6 +49,15 @@ from ...media.custom_post_asr import (
     default_headers_file,
     write_headers_template,
 )
+from ...providers.llm_models import fetch_models
+from ...providers.llm_providers import (
+    PROTOCOL_LABELS,
+    VENDOR_REGISTRY,
+    effective_vendor,
+    mask_secret,
+    resolve_protocol,
+    vendor_base_url,
+)
 
 
 def _scroll_page(inner: QWidget) -> QScrollArea:
@@ -53,12 +67,146 @@ def _scroll_page(inner: QWidget) -> QScrollArea:
     return scroll
 
 
+class ProfileManagerDialog(QDialog):
+    """大模型配置档案管理（重命名 / 复制 / 删除 / 排序）。
+
+    2026-10-04 新增。刻意**不含**导入/导出功能——档案里有 API Key，
+    导出等于给密钥开一个外流口子，收益不匹配风险。
+
+    删空由调用方拦截（至少要留一个，当前生效配置也依赖档案做模板）。
+    """
+
+    def __init__(self, parent, profiles: list) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("管理配置档案")
+        self.resize(560, 420)
+        self._profiles = [dict(p) for p in profiles]
+
+        root = QVBoxLayout(self)
+        self.list_w = QListWidget()
+        self.list_w.itemDoubleClicked.connect(lambda _: self._rename())
+        root.addWidget(QLabel(
+            "双击可重命名。\n"
+            "「复制」会连 API Key 一起复制（存主力 + 备用常用）。\n"
+            "「删除」不可撤销；至少要保留一个档案。"
+        ))
+        root.addWidget(self.list_w, 1)
+
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        self.btn_rename = QPushButton("重命名…")
+        self.btn_rename.clicked.connect(self._rename)
+        self.btn_dup = QPushButton("复制")
+        self.btn_dup.clicked.connect(self._duplicate)
+        self.btn_del = QPushButton("删除")
+        self.btn_del.clicked.connect(self._delete)
+        self.btn_up = QPushButton("上移")
+        self.btn_up.clicked.connect(lambda: self._move(-1))
+        self.btn_down = QPushButton("下移")
+        self.btn_down.clicked.connect(lambda: self._move(1))
+        for b in (self.btn_rename, self.btn_dup, self.btn_del,
+                  self.btn_up, self.btn_down):
+            rl.addWidget(b)
+        rl.addStretch(1)
+        root.addWidget(row)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+        self._reload()
+
+    # ---------- 内部 ----------
+
+    def _reload(self) -> None:
+        self.list_w.clear()
+        for p in self._profiles:
+            key = p.get("api_key") or ""
+            item = QListWidgetItem(
+                f"{p.get('label', p.get('id'))}    "
+                f"[{p.get('vendor') or '?'} / {p.get('model') or '无模型'}]    "
+                f"{mask_secret(key) if key else '（无 Key）'}"
+            )
+            item.setData(Qt.UserRole, p.get("id"))
+            self.list_w.addItem(item)
+        if self._profiles:
+            self.list_w.setCurrentRow(0)
+
+    def _current_idx(self) -> int:
+        return self.list_w.currentRow()
+
+    def _result_ok(self) -> None:
+        self.accept()
+
+    # ---------- 操作 ----------
+
+    def _rename(self) -> None:
+        i = self._current_idx()
+        if i < 0:
+            return
+        old = self._profiles[i].get("label", "")
+        name, ok = QInputDialog.getText(self, "重命名档案", "档案名称：", text=old)
+        if not ok or not name.strip():
+            return
+        # ⚠ 只改 label，**id 不动**——id 是配置里的引用锚点，改了会失联
+        self._profiles[i]["label"] = name.strip()
+        self._reload()
+        self.list_w.setCurrentRow(i)
+        self._result_ok()
+
+    def _duplicate(self) -> None:
+        i = self._current_idx()
+        if i < 0:
+            return
+        src = dict(self._profiles[i])
+        src["id"] = f"{src.get('id')}_copy{int(time.time())}"
+        src["label"] = f"{src.get('label', '')} 副本"
+        self._profiles.insert(i + 1, src)
+        self._reload()
+        self.list_w.setCurrentRow(i + 1)
+        self._result_ok()
+
+    def _delete(self) -> None:
+        i = self._current_idx()
+        if i < 0:
+            return
+        if len(self._profiles) <= 1:
+            QMessageBox.warning(self, "不能删空", "至少要保留一个档案。")
+            return
+        label = self._profiles[i].get("label", "")
+        if QMessageBox.question(
+            self, "删除档案",
+            f"确定删除「{label}」？\n\n此操作不可撤销（只影响档案，不会改动当前生效配置）。",
+        ) != QMessageBox.Yes:
+            return
+        self._profiles.pop(i)
+        self._reload()
+        self._result_ok()
+
+    def _move(self, delta: int) -> None:
+        i = self._current_idx()
+        j = i + delta
+        if i < 0 or not (0 <= j < len(self._profiles)):
+            return
+        self._profiles[i], self._profiles[j] = self._profiles[j], self._profiles[i]
+        self._reload()
+        self.list_w.setCurrentRow(j)
+        self._result_ok()
+
+    def result_profiles(self) -> list:
+        return self._profiles
+
+
 class SettingsDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("一览成文 — 设置")
         self.resize(640, 560)
         self._config: dict[str, Any] = {}
+        # 2026-10-04：最近一次抓到的模型列表，存档案时一起带进 models_cache
+        self._last_fetched_models: list = []
 
         root = QVBoxLayout(self)
         self.tabs = QTabWidget()
@@ -73,9 +221,231 @@ class SettingsDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
+        # 2026-10-04：右下角「管理配置档案…」。
+        # 放**左侧**而不是挤在 Save/Cancel 中间，是为了不破坏「Save 在最右」的肌肉记忆。
+        self.profiles_manage_btn = QPushButton("管理配置档案…")
+        self.profiles_manage_btn.clicked.connect(self._open_profile_manager)
+        buttons.layout().insertWidget(0, self.profiles_manage_btn)
         root.addWidget(buttons)
 
         self.load_from_disk()
+
+    def _on_llm_vendor_changed(self) -> None:
+        """切厂商时预填推荐 Base URL（可手改，不强制）。
+
+        只在 Base URL 为空、或还是上一个厂商的推荐值时才覆盖——
+        否则会把用户手填的自定义地址冲掉。
+        """
+        vendor = self.llm_vendor.currentData() or ""
+        suggested = vendor_base_url(vendor)
+        if not suggested:
+            return
+        cur = self.llm_base_url.text().strip()
+        # 当前为空，或等于任一厂商的推荐值（说明用户没手动改过）→ 才覆盖
+        if not cur or cur in {vendor_base_url(v) for v in VENDOR_REGISTRY}:
+            self.llm_base_url.setText(suggested)
+
+    def _on_fetch_models_clicked(self) -> None:
+        """抓取服务端模型列表（后台线程，不阻塞 UI）。"""
+        base_url = self.llm_base_url.text().strip()
+        api_key = self.llm_api_key.text().strip()
+        if not base_url:
+            QMessageBox.warning(self, "抓取模型", "请先填写 Base URL。")
+            return
+
+        # 抓取期间禁用按钮，防重复点击
+        self.llm_model_fetch_btn.setEnabled(False)
+        self.llm_model_fetch_btn.setText("抓取中…")
+
+        from PySide6.QtCore import QThread
+
+        class _FetchThread(QThread):
+            done = Signal(object, object)  # (models, error)
+
+            def __init__(self, url: str, key: str):
+                super().__init__()
+                self._url = url
+                self._key = key
+
+            def run(self) -> None:
+                try:
+                    models, err = fetch_models(self._url, self._key)
+                except Exception as e:  # 兜底：线程里绝不让异常冒出去
+                    models, err = [], f"{type(e).__name__}: {e}"
+                self.done.emit(models, err)
+
+        self._fetch_thread = _FetchThread(base_url, api_key)
+        self._fetch_thread.done.connect(self._on_fetch_models_done)
+        self._fetch_thread.finished.connect(
+            lambda: self.llm_model_fetch_btn.setEnabled(True)
+        )
+        self._fetch_thread.start()
+
+    def _on_fetch_models_done(self, models: list, err) -> None:
+        """抓取线程回调。⚠ 失败时**绝不清空** Model 已有的内容。"""
+        self.llm_model_fetch_btn.setText("⟳ 抓取")
+        current = self.llm_model.currentText().strip()
+        if err:
+            QMessageBox.warning(
+                self,
+                "抓取模型失败",
+                f"{err}\n\n"
+                f"不影响使用——Model 仍可手动填写。\n"
+                f"（已填内容不会被清空：{current or '（空）'}）",
+            )
+            return
+
+        # 保留用户已填的值（即使在列表里也别冲掉它——那可能是服务端已下线的模型）
+        self._last_fetched_models = list(models)
+        self.llm_model.clear()
+        if current:
+            self.llm_model.addItem(current)
+        self.llm_model.addItems(models)
+        self.llm_model.setCurrentIndex(0)
+        QMessageBox.information(
+            self,
+            "抓取模型成功",
+            f"已获取 {len(models)} 个模型，已填入下拉框。\n\n"
+            + "\n".join(models[:20])
+            + (f"\n… 还有 {len(models) - 20} 个" if len(models) > 20 else ""),
+        )
+
+    def _save_current_as_profile(self) -> None:
+        """把当前 8 字段 + 协议/厂商 存成一个档案。"""
+        name, ok = QInputDialog.getText(
+            self, "新建配置档案", "档案名称（例如：MiniMax M3 主力）："
+        )
+        if not ok or not name.strip():
+            return
+        profiles = self._get_profiles()
+        pid = f"p{len(profiles) + 1}_{int(time.time())}"
+        profiles.append(self._build_profile(pid, name.strip(), set_as_active=True))
+        self._set_profiles(profiles)
+        QMessageBox.information(
+            self, "已保存", f"档案「{name.strip()}」已保存并设为当前使用。\n"
+            f"点主对话框的「保存」才会写进 config.json。"
+        )
+
+    def _apply_selected_profile(self) -> None:
+        """把选中的档案套用到当前 8 字段。"""
+        pid = self.llm_profile_combo.currentData()
+        prof = next((p for p in self._get_profiles() if p.get("id") == pid), None)
+        if not prof:
+            QMessageBox.information(self, "档案", "请先在下拉框里选一个档案。")
+            return
+        self._apply_profile_to_ui(prof)
+        QMessageBox.information(
+            self, "已应用", f"档案「{prof.get('label')}」已套用到当前配置。\n"
+            f"记得点「保存」写盘。"
+        )
+
+    def _open_profile_manager(self) -> None:
+        """打开档案管理弹窗（重命名 / 复制 / 删除）。"""
+        dlg = ProfileManagerDialog(self, self._get_profiles())
+        if dlg.exec() != QDialog.Accepted:
+            return
+        new_profiles = dlg.result_profiles()
+        if new_profiles is None:
+            return
+        # 唯一必须拦住的操作：删空
+        if not new_profiles:
+            QMessageBox.warning(
+                self, "不能删空",
+                "至少要保留一个档案（当前生效配置也依赖档案做模板）。\n"
+                "若只想清理，请先「把当前存为新档案」再删。",
+            )
+            return
+        active = self.llm_profile_combo.currentData()
+        self._set_profiles(new_profiles, keep_active=active)
+        QMessageBox.information(
+            self, "档案已更新", f"当前共 {len(new_profiles)} 个档案。\n"
+            f"记得点主对话框的「保存」写进 config.json。"
+        )
+
+    # ---------- 档案读写（内部）----------
+
+    def _get_profiles(self) -> list:
+        """读当前内存里的档案列表（还没保存的那些也算）。"""
+        llm = (self._config.get("llm") or {})
+        profs = llm.get("profiles")
+        return [dict(p) for p in profs] if isinstance(profs, list) else []
+
+    def _set_profiles(self, profiles: list, keep_active: str | None = None) -> None:
+        llm = self._config.setdefault("llm", {})
+        llm["profiles"] = profiles
+        if keep_active is not None:
+            llm["active_profile"] = keep_active
+        self._config = llm and self._config
+        self._refresh_profile_combo()
+
+    def _build_profile(self, pid: str, label: str, set_as_active: bool = False) -> dict:
+        return {
+            "id": pid,
+            "label": label,
+            "protocol": self.llm_protocol.currentData() or "openai_chat",
+            "vendor": self.llm_vendor.currentData() or "custom",
+            "base_url": self.llm_base_url.text().strip(),
+            "api_key": self.llm_api_key.text().strip(),
+            "model": self.llm_model.currentText().strip(),
+            "temperature": self._ui_temperature(),
+            "max_tokens": self.llm_max_tokens.value(),
+            "timeout_seconds": self.llm_timeout.value(),
+            "max_retries": self.llm_retries.value(),
+            "models_cache": list(self._last_fetched_models),
+            "models_fetched_at": int(time.time()) if self._last_fetched_models else 0,
+        }
+
+    def _refresh_profile_combo(self) -> None:
+        cur = self.llm_profile_combo.currentData()
+        self.llm_profile_combo.blockSignals(True)
+        self.llm_profile_combo.clear()
+        for p in self._get_profiles():
+            self.llm_profile_combo.addItem(
+                f"{p.get('label', p.get('id'))}  ·  {p.get('model') or '（无模型）'}",
+                p.get("id"),
+            )
+        idx = self.llm_profile_combo.findData(cur)
+        if idx >= 0:
+            self.llm_profile_combo.setCurrentIndex(idx)
+        self.llm_profile_combo.blockSignals(False)
+        has = self.llm_profile_combo.count() > 0
+        self.llm_profile_apply_btn.setEnabled(has)
+        self.llm_profile_manage_btn.setEnabled(has)
+
+    def _apply_profile_to_ui(self, prof: dict) -> None:
+        """把档案内容套到 UI 控件上。"""
+        self.llm_protocol.setCurrentIndex(
+            max(0, self.llm_protocol.findData(prof.get("protocol") or "openai_chat"))
+        )
+        self.llm_vendor.setCurrentIndex(
+            max(0, self.llm_vendor.findData(prof.get("vendor") or "custom"))
+        )
+        self.llm_base_url.setText(str(prof.get("base_url") or ""))
+        self.llm_api_key.setText(str(prof.get("api_key") or ""))
+        # 档案里的 models_cache 填进下拉，方便切回来时还能选
+        cache = prof.get("models_cache") or []
+        self.llm_model.clear()
+        self.llm_model.addItems([str(m) for m in cache])
+        self.llm_model.setCurrentText(str(prof.get("model") or ""))
+        self.llm_temperature.setText(str(prof.get("temperature", 0.3)))
+        try:
+            self.llm_max_tokens.setValue(int(prof.get("max_tokens") or 12000))
+        except (TypeError, ValueError):
+            self.llm_max_tokens.setValue(12000)
+        try:
+            self.llm_timeout.setValue(int(prof.get("timeout_seconds") or 180))
+        except (TypeError, ValueError):
+            self.llm_timeout.setValue(180)
+        try:
+            self.llm_retries.setValue(int(prof.get("max_retries") or 3))
+        except (TypeError, ValueError):
+            self.llm_retries.setValue(3)
+
+    def _ui_temperature(self) -> float:
+        try:
+            return float(self.llm_temperature.text().strip() or 0.3)
+        except ValueError:
+            return 0.3
 
     def _on_cover_enable_toggled(self, checked: bool) -> None:
         if self._cover_pipeline_syncing:
@@ -121,12 +491,87 @@ class SettingsDialog(QDialog):
 
     def _build_llm_tab(self) -> None:
         page = QWidget()
-        form = QFormLayout(page)
-        self.llm_provider = QLineEdit()
+        outer = QVBoxLayout(page)
+        form = QFormLayout()
+        # 2026-10-04：标签列固定宽度，让「协议」「厂商」「API Key」等长短不一的
+        # 标签左边缘对齐（QFormLayout 默认按最长标签算宽度，但我们显式锁定，
+        # 这样以后增删行不会让整列标签宽度跳来跳去）
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        # ---- 配置档案区（2026-10-04 新增）----
+        prof_box = QGroupBox("配置档案")
+        prof_lay = QVBoxLayout(prof_box)
+        self.llm_profile_combo = QComboBox()
+        self.llm_profile_combo.setToolTip(
+            "已保存的大模型配置档案。选中一个点「应用到当前」即可套用。\n"
+            "档案是**模板库**：改档案不会自动改下面的字段，\n"
+            "需要点「应用到当前」才会覆盖（避免「以为在改档案，其实改的是当前配置」）。"
+        )
+        prof_btn_row = QWidget()
+        pbtn = QHBoxLayout(prof_btn_row)
+        pbtn.setContentsMargins(0, 0, 0, 0)
+        self.llm_profile_apply_btn = QPushButton("应用到当前")
+        self.llm_profile_apply_btn.clicked.connect(self._apply_selected_profile)
+        self.llm_profile_new_btn = QPushButton("把当前存为新档案")
+        self.llm_profile_new_btn.clicked.connect(self._save_current_as_profile)
+        self.llm_profile_manage_btn = QPushButton("管理…")
+        self.llm_profile_manage_btn.clicked.connect(self._open_profile_manager)
+        pbtn.addWidget(self.llm_profile_apply_btn)
+        pbtn.addWidget(self.llm_profile_new_btn)
+        pbtn.addWidget(self.llm_profile_manage_btn)
+        pbtn.addStretch(1)
+        prof_lay.addWidget(self.llm_profile_combo)
+        prof_lay.addWidget(prof_btn_row)
+        outer.addWidget(prof_box)
+
+        # ---- 基础字段 ----
+        self.llm_protocol = QComboBox()
+        for code, label in PROTOCOL_LABELS.items():
+            self.llm_protocol.addItem(label, code)
+        self.llm_protocol.setToolTip(
+            "**协议**决定用哪个 SDK、发什么格式的请求——不是厂商名。\n"
+            "绝大多数云服务 / 中转 / 本地推理都属 OpenAI 兼容类。\n"
+            "只有直接用 Claude 时才选 Anthropic 原生。"
+        )
+
+        self.llm_vendor = QComboBox()
+        for code, entry in VENDOR_REGISTRY.items():
+            self.llm_vendor.addItem(entry["label"], code)
+        self.llm_vendor.setToolTip(
+            "**厂商**只用于预填下面的 Base URL 和日志标识，Base URL 随时可手改。\n"
+            "切换厂商会自动填推荐地址，但不会覆盖你已经改过的内容。"
+        )
+        self.llm_vendor.currentIndexChanged.connect(self._on_llm_vendor_changed)
+
         self.llm_api_key = QLineEdit()
         self.llm_api_key.setEchoMode(QLineEdit.Password)
         self.llm_base_url = QLineEdit()
-        self.llm_model = QLineEdit()
+        self.llm_base_url.setPlaceholderText("https://api.example.com/v1")
+
+        # 2026-10-04：Model 改成**可编辑下拉**——
+        # 纯下拉在 provider 不给 /models 时会让人没法用，可编辑才能兜底手填
+        self.llm_model = QComboBox()
+        self.llm_model.setEditable(True)
+        self.llm_model.setInsertPolicy(QComboBox.NoInsert)
+        self.llm_model.setToolTip(
+            "模型名。可以点 ⟳ 从服务端自动抓取，也可以直接手打。\n"
+            "有些服务不提供 /models 接口，那就只能手填。\n"
+            "抓取失败不会清空这里已填的内容。"
+        )
+        self.llm_model_fetch_btn = QPushButton("⟳ 抓取")
+        self.llm_model_fetch_btn.setFixedWidth(78)
+        self.llm_model_fetch_btn.setToolTip(
+            "向 {Base URL}/models 发一个只读请求，列出该 Key 能用的模型。\n"
+            "不会消耗额度。任何失败都不会影响保存或手填。"
+        )
+        self.llm_model_fetch_btn.clicked.connect(self._on_fetch_models_clicked)
+        model_row = QWidget()
+        mlay = QHBoxLayout(model_row)
+        mlay.setContentsMargins(0, 0, 0, 0)
+        mlay.addWidget(self.llm_model, 1)
+        mlay.addWidget(self.llm_model_fetch_btn, 0)
+
         self.llm_temperature = QLineEdit()
         self.llm_max_tokens = QSpinBox()
         # 2026-09-10: 扩到 1M tokens 上限，兼容 MiniMax-M3 / Gemini 1.5+ / Claude 1M 上下文
@@ -142,14 +587,23 @@ class SettingsDialog(QDialog):
         self.llm_timeout.setRange(10, 3600)
         self.llm_retries = QSpinBox()
         self.llm_retries.setRange(0, 20)
-        form.addRow("Provider", self.llm_provider)
-        form.addRow("API Key", self.llm_api_key)
+
+        # 标签统一用「中文名（英文 key）」，长度接近 → 视觉对齐
+        form.addRow("协议 Protocol", self.llm_protocol)
+        form.addRow("厂商 Vendor", self.llm_vendor)
         form.addRow("Base URL", self.llm_base_url)
-        form.addRow("Model", self.llm_model)
+        form.addRow("API Key", self.llm_api_key)
+        form.addRow("Model", model_row)
         form.addRow("Temperature", self.llm_temperature)
         form.addRow("Max tokens", self.llm_max_tokens)
         form.addRow("超时(秒)", self.llm_timeout)
         form.addRow("重试次数", self.llm_retries)
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        # 让标签列宽度跟随最长项（"协议 Protocol"），所有行左边缘一致
+        form.setRowWrapPolicy(QFormLayout.DontWrapRows)
+        outer.addLayout(form)
+        outer.addStretch(1)
+
         self.tabs.addTab(_scroll_page(page), "大模型")
 
     def _build_transcribe_tab(self) -> None:
@@ -868,10 +1322,17 @@ class SettingsDialog(QDialog):
     def load_from_disk(self) -> None:
         self._config = load_config() or {}
         llm = self._config.get("llm") or {}
-        self.llm_provider.setText(str(llm.get("provider", "")))
+        # 2026-10-04：协议/厂商两个正交字段。旧配置只有 provider，
+        # 由 resolve_protocol()/effective_vendor() 兜底推导，**零改动继续能跑**。
+        self._config.setdefault("llm", llm)
+        pidx = self.llm_protocol.findData(resolve_protocol(llm))
+        self.llm_protocol.setCurrentIndex(pidx if pidx >= 0 else 0)
+        vidx = self.llm_vendor.findData(effective_vendor(llm))
+        self.llm_vendor.setCurrentIndex(vidx if vidx >= 0 else 0)
         self.llm_api_key.setText(str(llm.get("api_key", "")))
         self.llm_base_url.setText(str(llm.get("base_url", "")))
-        self.llm_model.setText(str(llm.get("model", "")))
+        self.llm_model.clear()
+        self.llm_model.setCurrentText(str(llm.get("model", "")))
         self.llm_temperature.setText(str(llm.get("temperature", "0.3")))
         self.llm_max_tokens.setValue(int(llm.get("max_tokens") or 12000))
         self.llm_timeout.setValue(int(llm.get("timeout_seconds") or 180))
@@ -1036,17 +1497,31 @@ class SettingsDialog(QDialog):
         except json.JSONDecodeError as exc:
             raise ValueError(f"图床 extra_fields JSON 无效: {exc}") from exc
 
+        llm_updates = {
+            # 2026-10-04：protocol/vendor 是新的一等字段。
+            # provider 保留写入是为了**向后兼容**——万一用户把 config 换回
+            # 旧结构（绿色包覆盖 / git 切回旧 commit），旧代码仍认得。
+            "protocol": self.llm_protocol.currentData() or "openai_chat",
+            "vendor": self.llm_vendor.currentData() or "custom",
+            "provider": self.llm_protocol.currentData() or "openai_chat",
+            "api_key": self.llm_api_key.text().strip(),
+            "base_url": self.llm_base_url.text().strip(),
+            "model": self.llm_model.currentText().strip(),
+            "temperature": temperature,
+            "max_tokens": self.llm_max_tokens.value(),
+            "timeout_seconds": self.llm_timeout.value(),
+            "max_retries": self.llm_retries.value(),
+        }
+        # ⚠ profiles 必须是 list（不是 dict）：deep_update 对 list 整体替换、
+        #   对 dict 递归合并——存成 dict 的话删除档案后 key 不会消失（幽灵档案）。
+        #   这里显式写出完整列表，保证删除真的生效。
+        profiles = self._get_profiles()
+        if profiles:
+            llm_updates["profiles"] = profiles
+            llm_updates["active_profile"] = self.llm_profile_combo.currentData() or ""
+
         return {
-            "llm": {
-                "provider": self.llm_provider.text().strip(),
-                "api_key": self.llm_api_key.text().strip(),
-                "base_url": self.llm_base_url.text().strip(),
-                "model": self.llm_model.text().strip(),
-                "temperature": temperature,
-                "max_tokens": self.llm_max_tokens.value(),
-                "timeout_seconds": self.llm_timeout.value(),
-                "max_retries": self.llm_retries.value(),
-            },
+            "llm": llm_updates,
             "transcribe": {
                 "asr_engine": self.tr_engine.currentData() or "funasr",
                 "funasr_model": self.tr_funasr.text().strip() or "sensevoice",

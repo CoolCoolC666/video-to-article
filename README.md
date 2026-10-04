@@ -414,6 +414,36 @@ xf_asr 集成期间按以下顺序踩坑订正协议层（每个 fix 都加 smok
 |------|------|----------|
 | **LLM `max_tokens` 扩到 1,000,000** | 上游默认 12,000 对长视频转写 + 长成稿模板不够<br>GUI `setRange(256, 1_000_000)` + tooltip 解释 | 长视频转写文本可达 100K+ 字符 + 提示词模板 5K 字符 + 成稿 50K 字符，12K 必截断 |
 | **「转写」Tab GUI 化** | Qwen3-ASR 5 字段（`model_id` / `context_file` / `hf_home` / `language` / `device`）直接暴露在「设置 → 转写 → Qwen3-ASR 高级」GroupBox + 文件浏览按钮 | 改一次不用手动编辑 JSON，错误率低 |
+| **LLM 协议 / 厂商 拆成两个正交字段** | `llm.protocol`（`openai_chat` / `anthropic`，决定用哪个 SDK、发什么格式）<br>`llm.vendor`（`minimax` / `deepseek` / `qwen`… 决定预填哪个 Base URL）<br>UI 上「协议 Protocol」「厂商 Vendor」两行**标签对齐**显示 | 原来 `provider` 一个字段同时承担「协议开关」和「厂商名」，语义混淆：填 `openai` + minimax base_url 实际是「OpenAI 兼容协议连 MiniMax」 |
+| **旧 config 零改动兼容** | `resolve_protocol()` 有 `protocol` 就用；没有就回落到旧 `provider`；**任何无法识别的 `provider` 值一律当 `openai_chat`**<br>写盘时 `provider` 仍保留写入 | 旧配置不用改一行就能跑；兜底顺带修掉「`provider` 写个空格就整个转写挂掉」 |
+| **模型列表自动抓取** | 「⟳ 抓取」按钮 → `GET {base_url}/models`，后台线程不阻塞 UI，结果进 **Model 可编辑下拉**<br>**抓取失败绝不清空已填内容、绝不阻断保存** | Model 名（如 `MiniMax-M2.7-highspeed`）手打极易错；且不是所有 provider 都提供 `/models`，必须留手填口子 |
+| **抓取走 requests 直连而非 openai SDK** | 新增 `providers/llm_models.py`，**不用 `client.models.list()`** | 实测 `openai 3.8.0` 缺 `jiter`（`pyproject` 只声明 `openai>=1.0.0`），`client.models` 属性访问直接 `ModuleNotFoundError`；`c.chat` 懒加载所以现有转写不受影响 |
+| **多配置档案 + 右下角管理入口** | 「设置 → 转写 → 大模型」顶部档案区（应用到当前 / 存为新档案 / 管理…）<br>对话框**右下角**另有「管理配置档案…」（放在 Save/Cancel 左侧，不破坏 Save 最右的肌肉记忆）<br>管理弹窗支持重命名 / 复制 / 删除 / 排序，**不可删空** | 切厂商不用每次手打 API Key + Base URL + Model 三件套 |
+| **档案与当前配置：8 字段为准，档案是模板库** | 改档案不自动改下方字段，需点「应用到当前」才覆盖 | 避免「以为在改档案、其实改的是当前配置」；`providers/llm.py` 一行不用改，零回归 |
+| **⚠ profiles 存 list 而不是 dict** | 见下方说明 | 这是本设计最容易埋雷的一处 |
+
+#### ⚠ 档案为什么必须存 list（最容易埋雷的一处）
+
+`config.py` 的 `deep_update` 是递归合并：
+
+```python
+for key, value in updates.items():
+    if isinstance(value, dict) and isinstance(base.get(key), dict):
+        deep_update(base[key], value)   # dict → 递归合并
+    else:
+        base[key] = value               # 其他（含 list）→ 整体替换
+```
+
+推论：
+
+| profiles 存成 | 删除一个档案时 | 结果 |
+| --- | --- | --- |
+| **list**（本项目采用） | 整体重写列表 | ✅ 删掉就真的没了 |
+| dict（key = 档案 id） | `deep_update` **递归合并** | ❌ 删掉的 key 不会消失 → **删不掉的幽灵档案** |
+
+这个区别在代码 review 时极难一眼看出，所以 `smoke_llm_settings.py` 里有一条
+**专门锁住这个行为**的测试（同时验证 list 正常、dict 会残留）。
+
 
 ### 健壮性
 

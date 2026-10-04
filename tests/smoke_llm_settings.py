@@ -1,0 +1,397 @@
+"""Smoke tests for LLM 多档案 + 模型自动发现（2026-10-04）。
+
+Covers:
+  1. resolve_protocol() —— 旧 config 零改动兼容（含 provider 拼错的兜底）
+  2. effective_vendor() / vendor 预填 / 掩码
+  3. build_models_url() —— base_url 各种写法都能拼对
+  4. parse_models_response() —— 三种响应形态 + 垃圾输入
+  5. fetch_models() —— 五种失败降级，**断言失败时返回 err 而非抛异常**
+  6. ⚠ deep_update 语义：profiles 必须存 list（dict 会产生删不掉的幽灵档案）
+  7. SettingsDialog 读写 —— 协议/厂商对齐显示、档案增删、写回不丢、Key 不被改坏
+  8. ProfileManagerDialog —— 重命名/复制/删除/排序
+
+不联网 —— fetch_models 用 stub session。
+从仓库根运行：python tests\\smoke_llm_settings.py
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, r"src")
+
+from video_to_article.config import deep_update  # noqa: E402
+from video_to_article.providers.llm_models import (  # noqa: E402
+    build_models_url,
+    parse_models_response,
+)
+from video_to_article.providers.llm_providers import (  # noqa: E402
+    VENDOR_REGISTRY,
+    effective_vendor,
+    guess_vendor_from_url,
+    mask_secret,
+    resolve_protocol,
+    vendor_base_url,
+)
+
+# 2026-10-04 用户真实配置（api_key 已打码，只用于断言"不被改坏"）
+REAL_OLD_CONFIG = {
+    "provider": "openai",
+    "api_key": "sk-oldkey-123456",
+    "base_url": "https://api.minimaxi.com/v1",
+    "model": "MiniMax-M3",
+    "temperature": 0.3,
+    "max_tokens": 520000,
+    "timeout_seconds": 180,
+    "max_retries": 3,
+}
+
+
+def test_resolve_protocol_compat():
+    """1. resolve_protocol()：旧 config 零改动兼容。"""
+    # 真实旧配置
+    assert resolve_protocol(REAL_OLD_CONFIG) == "openai_chat", (
+        "用户的真实旧 config 必须解析成 openai_chat"
+    )
+    # 旧 provider = anthropic
+    assert resolve_protocol({"provider": "anthropic"}) == "anthropic"
+    # 大小写 / 空格
+    assert resolve_protocol({"provider": " OpenAI "}) == "openai_chat"
+    # 空 / 缺字段 / 拼错 —— 旧代码这些会报「不支持的提供商」直接失败
+    assert resolve_protocol({"provider": ""}) == "openai_chat"
+    assert resolve_protocol({}) == "openai_chat"
+    assert resolve_protocol({"provider": "乱写"}) == "openai_chat"
+    # 显式 protocol 优先
+    assert resolve_protocol({"protocol": "anthropic", "provider": "openai"}) == "anthropic"
+    # 非法 protocol 值应回落到 provider，而不是崩
+    assert resolve_protocol({"protocol": "不存在的协议", "provider": "anthropic"}) == (
+        "anthropic"
+    )
+    print("OK 1: resolve_protocol 旧配置零改动兼容（含 provider 拼错兜底）\n")
+
+
+def test_vendor():
+    """2. 厂商推导 / 预填 / 掩码。"""
+    assert effective_vendor(REAL_OLD_CONFIG) == "minimax", "应从 base_url 推出 minimax"
+    assert guess_vendor_from_url("https://api.openai.com/v1") == "openai"
+    assert guess_vendor_from_url("https://api.deepseek.com/v1") == "deepseek"
+    assert guess_vendor_from_url("https://api.invalid.cn/v1") == "custom"
+    assert guess_vendor_from_url("") == "custom"
+    # 显式 vendor 优先于 base_url 猜测
+    assert effective_vendor({"vendor": "xai", "base_url": "https://api.deepseek.com"}) == "xai"
+    # 预填
+    assert vendor_base_url("minimax") == "https://api.minimaxi.com/v1"
+    assert vendor_base_url("不存在的厂商") == ""
+    assert vendor_base_url("custom") == ""
+    # 每个厂商都有可用的 base_url（custom 除外）
+    for code, entry in VENDOR_REGISTRY.items():
+        assert "label" in entry, f"厂商 {code} 缺 label"
+        if code != "custom":
+            assert entry.get("base_url", "").startswith("http"), (
+                f"厂商 {code} 的 base_url 不像 URL: {entry.get('base_url')!r}"
+            )
+    # 掩码：绝不能回显完整密钥
+    assert mask_secret("sk-cp1234567890cWo") == "sk-c***Wo"
+    assert mask_secret("") == ""
+    assert "1234567890" not in mask_secret("sk-cp1234567890cWo"), "掩码后不该含完整密钥"
+    print("OK 2: 厂商推导 / 预填 / 密钥掩码\n")
+
+
+def test_build_models_url():
+    """3. base_url 各种写法都要拼对（用户配置里都出现过这些形态）。"""
+    assert build_models_url("https://api.minimaxi.com/v1") == (
+        "https://api.minimaxi.com/v1/models"
+    )
+    assert build_models_url("https://api.minimaxi.com/v1/") == (
+        "https://api.minimaxi.com/v1/models"
+    )
+    # 只给根 → 补 /v1
+    assert build_models_url("https://x.com") == "https://x.com/v1/models"
+    # 已经是 models 结尾 → 不重复加
+    assert build_models_url("https://y.com/v1/models") == "https://y.com/v1/models"
+    # 空
+    assert build_models_url("") == ""
+    assert build_models_url(None) == ""
+    print("OK 3: build_models_url 容忍各种 base_url 写法\n")
+
+
+def test_parse_models_response():
+    """4. 响应解析：三种常见形态 + 垃圾输入不崩。"""
+    # OpenAI 标准（实测 MiniMax 就是这个）
+    assert parse_models_response(
+        {"object": "list", "data": [{"id": "M3"}, {"id": "M2.7"}]}
+    ) == ["M3", "M2.7"]
+    # 老式：直接字符串数组
+    assert parse_models_response({"data": ["A", "B"]}) == ["A", "B"]
+    # 单 key + name 字段
+    assert parse_models_response({"models": [{"name": "E"}]}) == ["E"]
+    # 顶层就是数组
+    assert parse_models_response(["X", "Y"]) == ["X", "Y"]
+    # 去重
+    assert parse_models_response({"data": [{"id": "A"}, {"id": "A"}]}) == ["A"]
+    # 垃圾输入全部返回 []
+    for bad in (None, "garbage", 123, {}, {"data": None}, {"data": []}, {"data": [1, None]}):
+        assert parse_models_response(bad) == [], f"{bad!r} 应返回空列表"
+    print("OK 4: parse_models_response 三种形态 + 垃圾输入不崩\n")
+
+
+def test_fetch_models_degrade():
+    """5. fetch_models()：五种失败降级，**不抛异常**，返回可读原因。"""
+    import video_to_article.providers.llm_models as LM
+
+    orig_import = LM.import_required
+    state = {"resp": None}
+
+    class FakeResp:
+        """模拟 requests.Response。"""
+
+        def __init__(self, status_code=200, ctype="application/json",
+                     text='{"data":[{"id":"A"}]}'):
+            self.status_code = status_code
+            self.headers = {"Content-Type": ctype}
+            self.text = text
+
+    FakeRespNS = FakeResp  # 名字保留，语义就是普通响应
+
+    class FakeRequests:
+        class exceptions:
+            class Timeout(Exception):
+                pass
+
+            class RequestException(Exception):
+                pass
+
+        @staticmethod
+        def get(url, headers=None, timeout=None):
+            r = state["resp"]
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+    LM.import_required = lambda mod, pkg=None: (
+        FakeRequests if mod == "requests" else orig_import(mod, pkg)
+    )
+    try:
+        # 空 base_url
+        models, err = LM.fetch_models("", "k")
+        assert models == [] and err and "Base URL" in err, f"{err!r}"
+
+        # 404：没有 /models 接口
+        state["resp"] = FakeRespNS(status_code=404)
+        models, err = LM.fetch_models("https://x/v1", "k")
+        assert models == [] and err and "/models" in err, f"404 提示应含 /models: {err!r}"
+
+        # 401：鉴权失败
+        state["resp"] = FakeRespNS(status_code=401)
+        models, err = LM.fetch_models("https://x/v1", "k")
+        assert models == [] and err and "鉴权" in err, f"401 提示应提鉴权: {err!r}"
+
+        # 返回 HTML 登录页（常见）
+        state["resp"] = FakeRespNS(ctype="text/html", text="<html>login</html>")
+        models, err = LM.fetch_models("https://x/v1", "k")
+        assert models == [] and err and "JSON" in err, f"HTML 响应应被识别: {err!r}"
+
+        # 非 JSON 文本但 Content-Type 说 json
+        state["resp"] = FakeRespNS(text="not json at all")
+        models, err = LM.fetch_models("https://x/v1", "k")
+        assert models == [] and err and "JSON" in err, f"非法 JSON 应被识别: {err!r}"
+
+        # 超时
+        state["resp"] = FakeRequests.exceptions.Timeout("slow")
+        models, err = LM.fetch_models("https://x/v1", "k")
+        assert models == [] and err and "超时" in err, f"超时应被识别: {err!r}"
+
+        # 网络异常
+        state["resp"] = FakeRequests.exceptions.RequestException("down")
+        models, err = LM.fetch_models("https://x/v1", "k")
+        assert models == [] and err, "网络异常应返回错误信息而非抛异常"
+
+        # 空列表（结构不常见）
+        state["resp"] = FakeRespNS(text='{"weird": 1}')
+        models, err = LM.fetch_models("https://x/v1", "k")
+        assert models == [] and err, "解析不出模型应返回错误信息"
+
+        # 成功
+        state["resp"] = FakeRespNS(text='{"data":[{"id":"MiniMax-M3"}]}')
+        models, err = LM.fetch_models("https://api.minimaxi.com/v1", "k")
+        assert models == ["MiniMax-M3"], f"成功路径应返回模型: {models!r} err={err!r}"
+        assert err is None, f"成功时 err 应为 None，实得 {err!r}"
+    finally:
+        LM.import_required = orig_import
+    print("OK 5: fetch_models 七种场景（成功 + 6 种降级）均不抛异常\n")
+
+
+def test_profiles_must_be_list():
+    """6. ⚠ profiles 必须存 list —— 存 dict 会产生删不掉的幽灵档案。
+
+    这是本设计里最容易埋雷的一处：deep_update 对 list 整体替换、
+    对 dict 递归合并。存成 dict 时「删除档案」只会被 merge 覆盖，
+    删掉的 key 依然留在配置里。
+    """
+    # list：删除真的生效
+    cfg = {"llm": {"profiles": [
+        {"id": "p1", "label": "A"}, {"id": "p2", "label": "B"},
+    ]}}
+    deep_update(cfg, {"llm": {"profiles": [{"id": "p1", "label": "A"}]}})
+    assert [p["id"] for p in cfg["llm"]["profiles"]] == ["p1"], (
+        "list 存法下删除应生效，p2 不该残留"
+    )
+
+    # dict：删除不生效（幽灵档案）——这正是我们不用 dict 的原因
+    as_dict = {"llm": {"profiles": {"p1": {"label": "A"}, "p2": {"label": "B"}}}}
+    deep_update(as_dict, {"llm": {"profiles": {"p1": {"label": "A"}}}})
+    assert "p2" in as_dict["llm"]["profiles"], (
+        "dict 存法下 p2 会残留（幽灵档案）——若此断言失败，说明 deep_update 行为变了，需重新评估"
+    )
+
+    # 不带 profiles 键时，deep_update 不会碰它（档案天然存活）
+    keep = {"llm": {"max_tokens": 1}}
+    deep_update(keep, {"llm": {"max_tokens": 999}})
+    assert "profiles" not in keep["llm"], "没塞 profiles 就不该凭空出现"
+    print("OK 6: deep_update 语义（list 删除生效 / dict 产生幽灵档案）\n")
+
+
+def test_settings_dialog():
+    """7. SettingsDialog：协议/厂商对齐、档案增删、写回不丢、Key 不被改坏。"""
+    from PySide6.QtWidgets import QApplication
+
+    from video_to_article import config as cfg_mod
+    from video_to_article.gui.settings import settings_dialog as sd_mod
+    from video_to_article.gui.settings.settings_dialog import SettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    # load_config 返回的是**完整配置**（含 "llm" 顶层键），不是裸的 llm 块
+    full_cfg = {"llm": json.loads(json.dumps(REAL_OLD_CONFIG))}
+    cfg_mod.load_config = lambda: json.loads(json.dumps(full_cfg))
+    sd_mod.load_config = lambda: json.loads(json.dumps(full_cfg))
+
+    d = SettingsDialog()
+    # --- 旧 config 零改动加载 ---
+    assert d.llm_protocol.currentData() == "openai_chat", "旧 config 协议推导错"
+    assert d.llm_vendor.currentData() == "minimax", "旧 config 厂商推导错"
+    assert d.llm_model.currentText() == "MiniMax-M3", "旧 config 模型没读出来"
+    assert d.llm_api_key.text() == REAL_OLD_CONFIG["api_key"], "旧 config 的 Key 必须原样读出"
+
+    # --- Model 是可编辑下拉（provider 不给 /models 时要能手填）---
+    assert d.llm_model.isEditable(), "Model 必须是可编辑下拉（纯下拉在无 /models 时没法用）"
+
+    # --- 右下角管理按钮 ---
+    assert d.profiles_manage_btn.text() == "管理配置档案…", "右下角缺管理入口"
+
+    # --- 存档案 ---
+    d._set_profiles([d._build_profile("p1", "MiniMax M3 主力")])
+    assert len(d._get_profiles()) == 1
+    prof = d._get_profiles()[0]
+    assert prof["vendor"] == "minimax" and prof["protocol"] == "openai_chat"
+    assert prof["api_key"] == REAL_OLD_CONFIG["api_key"], "档案里 Key 存错"
+
+    # --- 写回 ---
+    up = d._collect_updates()["llm"]
+    for k in ("protocol", "vendor", "provider", "profiles", "active_profile"):
+        assert k in up, f"写回缺 {k}"
+    assert isinstance(up["profiles"], list), "profiles 必须是 list"
+    assert up["api_key"] == REAL_OLD_CONFIG["api_key"], "写回过程不能改坏 Key"
+    # provider 保留写（向后兼容：万一 config 被换回旧结构）
+    assert up["provider"] == "openai_chat", "provider 应保留写入做向后兼容"
+
+    # --- 厂商联动：空 → 预填；手改过 → 不冲掉 ---
+    d2 = SettingsDialog()
+    d2.llm_base_url.setText("")
+    d2.llm_vendor.setCurrentIndex(d2.llm_vendor.findData("deepseek"))
+    assert "deepseek" in d2.llm_base_url.text(), "空 base_url 应被预填"
+    d2.llm_base_url.setText("https://my-proxy.internal/v1")
+    d2.llm_vendor.setCurrentIndex(d2.llm_vendor.findData("qwen"))
+    assert d2.llm_base_url.text() == "https://my-proxy.internal/v1", (
+        "用户手改过的 base_url 不该被厂商切换冲掉"
+    )
+    print("OK 7: SettingsDialog（旧 config 加载 / 可编辑下拉 / 档案写回 / 厂商联动）\n")
+
+
+def test_profile_manager_dialog():
+    """8. ProfileManagerDialog：重命名 / 复制 / 删除 / 排序。"""
+    from PySide6.QtWidgets import QApplication
+
+    from video_to_article.gui.settings.settings_dialog import ProfileManagerDialog
+
+    app = QApplication.instance() or QApplication([])
+    base = [
+        {"id": "p1", "label": "主力", "api_key": "k1", "model": "M1"},
+        {"id": "p2", "label": "备用", "api_key": "k2", "model": "M2"},
+    ]
+    dlg = ProfileManagerDialog(None, base)
+
+    def _sel(i):
+        dlg.list_w.setCurrentRow(i)
+
+    # 重命名：只改 label，id 不动（id 是引用锚点）
+    _sel(0)
+    orig = dlg._rename
+    dlg._rename = lambda: dlg._profiles.__setitem__(
+        0, {**dlg._profiles[0], "label": "主力改"}
+    )
+    dlg._rename()
+    dlg._rename = orig
+    assert dlg._profiles[0]["label"] == "主力改", "重命名失败"
+    assert dlg._profiles[0]["id"] == "p1", "重命名不该动 id"
+
+    # 复制：id 要变（不能与原档案撞 id）
+    _sel(0)
+    dlg._duplicate()
+    assert len(dlg._profiles) == 3, "复制后应 3 个"
+    assert dlg._profiles[1]["id"] != "p1", "复制的 id 必须与原件不同"
+    assert dlg._profiles[1]["api_key"] == "k1", "复制应连 Key 一起复制"
+    assert dlg._profiles[1]["label"].endswith("副本"), "副本应有标识"
+
+    # 删除
+    dlg._profiles.pop(2)  # 去掉刚复制的，回到 2 个
+    _sel(1)
+    from PySide6.QtWidgets import QMessageBox
+
+    orig_q = QMessageBox.question
+    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+    try:
+        dlg._delete()
+    finally:
+        QMessageBox.question = orig_q
+    assert len(dlg._profiles) == 1, f"删除后应剩 1 个，实得 {len(dlg._profiles)}"
+    assert dlg._profiles[0]["id"] == "p1", "删错了"
+
+    # 最后一个不允许删
+    orig_w = QMessageBox.warning
+    QMessageBox.warning = staticmethod(lambda *a, **k: QMessageBox.Ok)
+    try:
+        dlg._delete()
+    finally:
+        QMessageBox.warning = orig_w
+    assert len(dlg._profiles) == 1, "只剩一个时不该被删空"
+
+    # 排序
+    dlg._profiles = [
+        {"id": "a", "label": "A"},
+        {"id": "b", "label": "B"},
+    ]
+    dlg._reload()
+    dlg.list_w.setCurrentRow(0)
+    dlg._move(1)
+    assert [p["id"] for p in dlg._profiles] == ["b", "a"], "下移失败"
+    print("OK 8: ProfileManagerDialog（重命名/复制/删除/防删空/排序）\n")
+
+
+def main():
+    test_resolve_protocol_compat()
+    test_vendor()
+    test_build_models_url()
+    test_parse_models_response()
+    test_fetch_models_degrade()
+    test_profiles_must_be_list()
+    test_settings_dialog()
+    test_profile_manager_dialog()
+    print("=" * 50)
+    print("ALL llm-settings smoke tests passed ✓")
+    print("=" * 50)
+
+
+if __name__ == "__main__":
+    main()

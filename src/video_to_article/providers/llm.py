@@ -5,6 +5,7 @@ from typing import Optional
 from ..logging_config import configure_logging
 from ..prompts import load_prompt
 from ..text_utils import format_time
+from .llm_providers import effective_vendor, resolve_protocol
 
 logger = configure_logging()
 
@@ -36,17 +37,23 @@ def optimize_text_with_llm(text: str, config: dict, prompt_name: str = "evaluati
         return None
 
     llm_config = config["llm"]
-    provider = llm_config.get("provider", "openai")
+    # 2026-10-04：provider 字段的语义从「厂商」纠正为「协议」。
+    # 旧配置零改动继续可用（resolve_protocol 内部回落到 provider 字段）。
+    protocol = resolve_protocol(llm_config)
+    vendor = effective_vendor(llm_config)
 
-    logger.info(f"使用 {provider} 和提示词 '{prompt_name}' 进行文本优化...")
+    logger.info(
+        f"使用 {vendor}（{protocol} 协议）和提示词 '{prompt_name}' 进行文本优化..."
+    )
 
     try:
-        if provider == "openai":
-            return _optimize_with_openai(text, llm_config, prompt_name)
-        if provider == "anthropic":
+        if protocol == "anthropic":
             return _optimize_with_anthropic(text, llm_config, prompt_name)
-
-        logger.error(f"不支持的提供商: {provider}")
+        if protocol == "openai_chat":
+            return _optimize_with_openai(text, llm_config, prompt_name)
+        # resolve_protocol 只认 PROTOCOL_LABELS 里的值，走不到这里；
+        # 保留兜底是因为将来加协议时可能忘了接分支。
+        logger.error(f"不支持的协议: {protocol}")
         return None
     except Exception as e:
         logger.error(f"文本优化失败: {e}")

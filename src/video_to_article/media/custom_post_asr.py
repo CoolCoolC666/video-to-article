@@ -1267,7 +1267,25 @@ def _normalize_dashscope_result(payload) -> dict:
             f"顶层键: {sorted(payload)[:12]}"
         )
     speakers = {s["speaker"] for s in segments if s["speaker"]}
-    return {"text": plain, "segments": segments, "n_speakers": len(speakers)}
+    # duration 取服务端给的**真实音频时长**（毫秒 → 秒）。
+    # 比本地 ffprobe 探测更准（探测的是切段/转码后的文件），
+    # 供 _assemble 的时间轴累加用，省掉一次 ffprobe 调用。
+    duration = 0.0
+    props = payload.get("properties")
+    for src in (props if isinstance(props, dict) else {}, payload):
+        if isinstance(src, dict):
+            duration = _sec(src, "original_duration_in_milliseconds",
+                            "duration_in_milliseconds", "duration")
+            if duration:
+                break
+    if not duration and segments:
+        duration = max((s["end"] for s in segments), default=0.0)
+    return {
+        "text": plain,
+        "segments": segments,
+        "n_speakers": len(speakers),
+        "duration": duration,
+    }
 
 
 
@@ -1506,9 +1524,16 @@ def transcribe_audio_with_custom_post(audio_path: str, config: dict) -> str:
             speaker_count=int(cfg.get("speaker_count") or 2),
             colloquial_proc=bool(cfg.get("colloquial_proc", False)),
         )
+        # ⚠ `duration` 在下面（openai 兼容路径）才探测，本分支在 1520 行之前就 return，
+        #   直接用会 UnboundLocalError。这里优先取 DashScope 返回的真实时长
+        #   （properties.original_duration_in_milliseconds，比本地探测更准），
+        #   拿不到再回落 ffprobe。
+        dur = float(result.get("duration") or 0.0)
+        if dur <= 0:
+            dur = _probe_audio_duration(audio_path_obj)
         text = _assemble(
             [result], role_separation, timestamps,
-            chunk_durations=[duration if duration > 0 else 0.0],
+            chunk_durations=[dur if dur > 0 else 0.0],
         )
         logger.info(
             f"DashScope 转写完成 (耗时: {format_time(time.time() - t0)}，"

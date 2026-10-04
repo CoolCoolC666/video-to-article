@@ -814,6 +814,69 @@ def test_presigned_url_not_double_encoded():
     print("OK 12d: presigned 签名的 % 不被二次编码，中文/空格仍正常编码")
 
 
+# ------- 12e: DashScope 主入口的 duration 必须已绑定（真实踩到的 UnboundLocalError）
+def test_dashscope_entry_duration_bound():
+    """打用户真实日志撞出来的：
+
+        [INFO] 任务完成（第 7 次轮询），结果链接已拿到
+        [ERROR] cannot access local variable 'duration' where it is not associated with a value
+
+    根因：DashScope 分支里 `_assemble(... duration ...)` 写在了
+    `duration = _probe_audio_duration(...)` **之前**，而该分支在探测之前就 return。
+    ⚠ 单测没抓到，是因为组内用例全走 mock / 只测单个子函数，
+       **主入口的新分支从没被整体跑过**。所以这里必须端到端跑一次入口。
+    """
+    import tempfile
+    from video_to_article.media.custom_post_asr import (
+        transcribe_audio_with_custom_post as entry,
+    )
+
+    # 造一个极小的假音频（ffprobe 探测不到时长也不该崩）
+    audio = pathlib.Path(tempfile.gettempdir()) / "smoke_ds_entry.mp3"
+    audio.write_bytes(b"ID3" + b"\0" * 512)
+
+    # 端到端：提交 → 轮询 → 下载，全部 mock，但**走真实主入口**
+    s = use(FakeSession(
+        post_script=[FakeResp(200, {"output": {"task_id": "t-e2e"}})],
+        get_script=[FakeResp(200, {"output": {
+            "task_status": "SUCCEEDED",
+            "results": [{"subtask_status": "SUCCEEDED",
+                         "transcription_url": "https://x/r.json"}],
+        }})],
+    ))
+    orig_download = cp._dashscope_download
+    cp._dashscope_download = lambda link, timeout=120: {
+        "file_url": "https://x/a.mp3",
+        "properties": {"original_duration_in_milliseconds": 3834},
+        "transcripts": [{"text": "整段", "sentences": [
+            {"begin_time": 100, "end_time": 3820, "text": "整段"}]}],
+    }
+    try:
+        text = entry(str(audio), {
+            "api_key": "K",
+            "api_style": "dashscope_async",
+            "endpoint": BASE,
+            "model": "qwen-audio-3.0-asr-flash-filetrans",
+            # 显式给 audio_url，跳过图床（这里不测上传）
+            "audio_url": "https://cdn.x/a.mp3",
+            "timestamps": True,
+        })
+    finally:
+        cp._dashscope_download = orig_download
+        done()
+        if audio.exists():
+            audio.unlink()
+
+    assert "整段" in text, f"入口应返回转写文本，实际: {text[:120]!r}"
+    assert "[00:00]" in text, f"时间戳应生效: {text[:120]!r}"
+    # duration 应来自服务端 properties（3834ms → 3.834s）
+    assert cp._normalize_dashscope_result({
+        "properties": {"original_duration_in_milliseconds": 3834},
+        "transcripts": [{"text": "x", "sentences": []}],
+    })["duration"] == 3.834
+    print("OK 12e: DashScope 主入口端到端可跑通（duration 取服务端 properties，不再 unbound）")
+
+
 def main():
     test_endpoint_building()
     test_submit_body()
@@ -833,6 +896,7 @@ def main():
     test_dedicated_deployment_hint()
     test_poll_headers_exclude_async_flag()
     test_presigned_url_not_double_encoded()
+    test_dashscope_entry_duration_bound()
     print()
     print("smoke_dashscope_asr: 全部通过 ✓")
 

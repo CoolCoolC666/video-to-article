@@ -287,10 +287,18 @@ fun-asr                              Fun-ASR
 paraformer-v2                        仅北京地域
 ```
 
-> ⚠ **如果换成异步模型名后仍然报 `current user api does not support asynchronous calls`**，
-> 那就不是模型名的问题了。官方文档的解释是：**当前这个部署只支持同步调用**。
-> 端点形如自定义域名 / `qianwenaiapi.com` 的属于**独享部署**（公共端点是
-> `dashscope.aliyuncs.com`）——独享部署是否开通异步能力由控制台决定，程序改不了。
+> ⚠ **实测结论（2026-10-04，同一独享部署端点 + 同一把 Key）**：
+> 这句 403 绝大多数情况是**模型名填成了同步模型**，不是部署问题：
+>
+> | 模型名 | 结果 |
+> |---|---|
+> | `qwen-audio-3.0-asr-flash-filetrans` | 200，正常拿到 task_id ✅ |
+> | `qwen3-asr-flash-filetrans` | 200，正常拿到 task_id ✅ |
+> | `qwen3-asr-flash`（同步） | 403 `...does not support asynchronous calls` ❌ |
+>
+> 官方文档另提到：调用**独享部署**（端点形如 `<自定义>.maas.aliyuncs.com` /
+> `qianwenaiapi.com`，公共端点是 `dashscope.aliyuncs.com`）报这句时，
+> 可能该部署只支持同步。**但按上面的实测，换对模型名后即可正常提交。**
 
 > ⚠ **开了说话人分离后，官方建议音频不超过 2 小时**，否则可能失败或超时
 > （`diarization_enabled` 本身仅支持**单声道**）。

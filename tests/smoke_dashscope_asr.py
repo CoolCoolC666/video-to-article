@@ -728,13 +728,15 @@ def test_dedicated_deployment_hint():
         raise SystemExit("应该抛错但没抛")
     except RuntimeError as e:
         msg = str(e)
-        # 两条路都要说
-        assert "独享部署" in msg, msg
-        assert "只支持同步" in msg, msg
+        # 主因必须是模型名（实测：换对模型名后同一部署就能 200）
+        assert "qwen-audio-3.0-asr-flash-filetrans" in msg, "应给出实测可用的模型名"
+        assert "qwen3-asr-flash-filetrans" in msg, msg
         assert "qwen3-asr-flash-filetrans" in msg, "应回显当前模型名供核对"
-        assert "控制台" in msg, "应指出「部署没开通异步」这条程序改不了的路"
-        assert "dashscope.aliyuncs.com" in msg, "应给出公共端点作为对照验证手段"
-    print("OK 12b: 「不支持异步」提示同时给出换模型 + 查部署两条路（不让人换完仍撞墙）")
+        assert "绝大多数" in msg, "应说明主因是模型名，而非把部署问题摆在前面"
+        # 部署形态作为次要可能保留（官方文档确实这么写）
+        assert "独享部署" in msg, "官方文档提到的部署形态仍应保留"
+        assert "换完仍报" in msg, "应说明何时才需要去查部署"
+    print("OK 12b: 「不支持异步」提示以模型名为主因（附实测结论），部署形态作为次要可能")
 
 
 def main():

@@ -903,21 +903,22 @@ def _raise_dashscope_submit_error(resp, url: str, model: str) -> None:
     if "asynchronous" in blob or "异步" in blob:
         raise RuntimeError(
             base
-            + "\n\n⚠ 这句报错的官方含义是：**当前这个部署只支持同步调用**"
-              "（不只是模型名的问题）。\n"
-              "  官方文档原文：「如果您调用独享部署的模型服务时收到报错"
-              "current user api does not support asynchronous calls，"
-              "表示该部署仅支持同步调用，请将请求头改为 X-DashScope-Async: disable」。\n\n"
-              "  你的端点形如自定义域名 / qianwenaiapi.com，属于**独享部署**"
-              "（公共端点是 dashscope.aliyuncs.com）。\n"
-              "  两种可能：\n"
-              "   ① 模型名填的是同步模型 → 换成 -filetrans 结尾的异步模型\n"
-              f"      （你当前填的是 {model}）\n"
-              "   ② 模型名没错，但**这个部署本身没开通异步能力** → 程序改不了，\n"
-              "      要去阿里云百炼控制台确认该部署是否支持异步转写\n\n"
-              "  确认办法：用同一个 Key 调公共端点 "
-              "https://dashscope.aliyuncs.com/api/v1 试一次，\n"
-              "  公共端点一定是支持异步的（前提是 Key 同地域）。"
+            + "\n\n⚠ 这句 403 绝大多数情况是**模型名填成了同步模型**。\n"
+              "  实测（同一个独享部署端点，同一把 Key）：\n"
+              "    qwen-audio-3.0-asr-flash-filetrans → 200，正常拿到 task_id ✅\n"
+              "    qwen3-asr-flash-filetrans          → 200，正常拿到 task_id ✅\n"
+              "    qwen3-asr-flash（同步）              → 403，就是这句 ❌\n"
+            f"  你当前填的是：**{model}**\n\n"
+              "  → 改成以 -filetrans 结尾的异步模型名再试：\n"
+              "      qwen-audio-3.0-asr-flash-filetrans\n"
+              "      qwen3-asr-flash-filetrans\n"
+              "      fun-asr\n"
+              "      paraformer-v2（仅北京地域）\n\n"
+              "  官方文档还提到另一种可能：调用**独享部署**时若报这句，说明该部署\n"
+              "  只支持同步。独享部署的端点形如 <自定义>.maas.aliyuncs.com /\n"
+              "  qianwenaiapi.com（公共端点是 dashscope.aliyuncs.com）。\n"
+              "  但按上面实测，换对模型名后你的部署是支持异步的；\n"
+              "  若换完仍报同样这句，才需要去控制台确认部署形态。"
         )
     raise RuntimeError(base)
 

@@ -281,9 +281,10 @@ def test_settings_dialog():
     assert d.profiles_manage_btn.text() == "管理配置档案…", "右下角缺管理入口"
 
     # --- 存档案 ---
-    d._set_profiles([d._build_profile("p1", "MiniMax M3 主力")])
-    assert len(d._get_profiles()) == 1
-    prof = d._get_profiles()[0]
+    _spec = d._spec("llm")
+    d._set_profiles(_spec, [dict(_spec.fields(d), id="p1", label="MiniMax M3 主力")])
+    assert len(d._get_profiles(_spec)) == 1
+    prof = d._get_profiles(_spec)[0]
     assert prof["vendor"] == "minimax" and prof["protocol"] == "openai_chat"
     assert prof["api_key"] == REAL_OLD_CONFIG["api_key"], "档案里 Key 存错"
 
@@ -313,7 +314,7 @@ def test_profile_manager_dialog():
     """8. ProfileManagerDialog：重命名 / 复制 / 删除 / 排序。"""
     from PySide6.QtWidgets import QApplication
 
-    from video_to_article.gui.settings.settings_dialog import (
+    from video_to_article.gui.profile_store import (
         PROFILE_SPEC_LLM,
         ProfileManagerDialog,
     )
@@ -393,12 +394,12 @@ def test_custom_post_profiles():
 
     from video_to_article import config as cfg_mod
     from video_to_article.gui.settings import settings_dialog as sd_mod
-    from video_to_article.gui.settings.settings_dialog import (
+    from video_to_article.gui.profile_store import (
         PROFILE_SPEC_ASR,
         PROFILE_SPEC_LLM,
         ProfileManagerDialog,
-        SettingsDialog,
     )
+    from video_to_article.gui.settings.settings_dialog import SettingsDialog
 
     app = QApplication.instance() or QApplication([])
     cfg = {
@@ -426,18 +427,20 @@ def test_custom_post_profiles():
     assert d.cp_language.currentData() == "zh"
     assert d.cp_role_separation.isChecked() is True
     assert d.cp_max_wait.value() == 600
-    assert d._cp_get_profiles() == [], "没有档案时不该凭空造出来"
+    assert d._get_profiles(d._spec("cp")) == [], "没有档案时不该凭空造出来"
 
     # --- 存两个档案，各自指向不同请求头文件 ---
+    _cspec = d._spec("cp")
     d.cp_headers_file.setText("D:/hdr/minimax.txt")
-    d._cp_set_profiles([d._cp_build_profile("cp1", "MiniMax 官方")])
+    d._set_profiles(_cspec, [dict(_cspec.fields(d), id="cp1", label="MiniMax 官方")])
     d.cp_headers_file.setText("D:/hdr/gateway.txt")
     d.cp_endpoint.setText("https://gw.internal/stt")
-    d._cp_set_profiles(
-        d._cp_get_profiles() + [d._cp_build_profile("cp2", "私有网关")],
+    d._set_profiles(
+        _cspec,
+        d._get_profiles(_cspec) + [dict(_cspec.fields(d), id="cp2", label="私有网关")],
         keep_active="cp2",
     )
-    profs = d._cp_get_profiles()
+    profs = d._get_profiles(_cspec)
     assert len(profs) == 2, f"应存 2 个档案，实得 {len(profs)}"
     assert profs[0]["headers_file"] == "D:/hdr/minimax.txt"
     assert profs[1]["headers_file"] == "D:/hdr/gateway.txt", (
@@ -446,7 +449,7 @@ def test_custom_post_profiles():
     assert profs[1]["endpoint"] == "https://gw.internal/stt"
 
     # --- 应用档案应把 UI 切回对应配置 ---
-    d._cp_apply_profile_to_ui(profs[0])
+    d._apply_cp_profile_to_ui(profs[0])
     assert d.cp_endpoint.text() == "https://api.minimax.cn/v1/speech_to_text"
     assert d.cp_headers_file.text() == "D:/hdr/minimax.txt"
     assert d.cp_api_key.text() == "sk-cp-key-123456"
@@ -474,6 +477,11 @@ def test_custom_post_profiles():
     assert [p["id"] for p in c2["transcribe"]["custom_post"]["profiles"]] == ["cp1"]
 
     # --- 共用弹窗按规格渲染，且 Key 不明文显示 ---
+    from video_to_article.gui.profile_store import (
+        PROFILE_SPEC_ASR,
+        ProfileManagerDialog,
+    )
+
     dlg = ProfileManagerDialog(
         None, profs, PROFILE_SPEC_ASR, kind_label="自定义（POST）"
     )
@@ -495,6 +503,150 @@ def test_custom_post_profiles():
     print("OK 9: custom_post 多档案（独立请求头文件 / 互不干扰 / 共用弹窗）\n")
 
 
+def test_asr_engine_list_shared():
+    """10. 引擎清单单一真源：settings 与「覆盖本次 ASR」必须同源。
+
+    2026-10-04 用户报「覆盖本次 ASR 选项一直没有更新」——根因是
+    `common_options.AsrOptions` 里手写了只有 funasr / whisper 的引擎列表，
+    而 settings 里已经有 5 个。两份列表漂移，新引擎在「覆盖本次」里**选不到**，
+    用户只能去改全局默认——而「覆盖本次」的意义正是只改这一条。
+
+    修法：抽 `gui/asr_engines.py` 作为唯一清单，两边都从它读。
+    """
+    from video_to_article.gui.asr_engines import (
+        ASR_ENGINE_LABELS,
+        engine_label,
+        normalize_engine,
+    )
+
+    codes = [c for _, c in ASR_ENGINE_LABELS]
+    assert codes == ["funasr", "whisper", "qwen_asr", "xf_asr", "custom_post"], (
+        f"引擎清单不对: {codes}"
+    )
+    # 旧名兼容
+    assert normalize_engine("minimax_asr") == "custom_post", "旧引擎名没归一"
+    assert normalize_engine("custom_post") == "custom_post"
+    assert normalize_engine("") == ""
+    assert "FunASR" in engine_label("funasr")
+    assert engine_label("不存在") == "不存在"
+
+    # 两处 UI 必须用同一份清单
+    from video_to_article.gui.settings import settings_dialog as sd_mod
+
+    src_settings = open(sd_mod.__file__, encoding="utf-8").read()
+    assert "ASR_ENGINE_LABELS" in src_settings, "settings 没用共享清单"
+    assert 'self.tr_engine.addItem("funasr"' not in src_settings, (
+        "settings 里还留着手写的引擎列表（会再次漂移）"
+    )
+
+    import video_to_article.gui.widgets.common_options as co
+
+    src_co = open(co.__file__, encoding="utf-8").read()
+    assert "ASR_ENGINE_LABELS" in src_co, "覆盖本次 ASR 没用共享清单"
+    assert 'self.engine.addItem("FunASR")' not in src_co, (
+        "覆盖本次 ASR 里还留着手写列表（新引擎会选不到）"
+    )
+    print("OK 10: 引擎清单单一真源（两处 UI 同源 + 旧名归一）\n")
+
+
+def test_cover_and_host_profiles():
+    """11. AI 封面 / 图床 也有档案区（2026-10-04 用户要求）。
+
+    封面常在多套生图服务间切（ModelScope / OpenAI 兼容 / xAI），
+    图床常在多套图床间切（Chevereto / 自建 / 各家 API）——都是高频切换场景。
+    """
+    from PySide6.QtWidgets import QApplication
+
+    from video_to_article import config as cfg_mod
+    from video_to_article.gui.settings import settings_dialog as sd_mod
+    from video_to_article.gui.settings.settings_dialog import SettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    cfg = {
+        "llm": json.loads(json.dumps(REAL_OLD_CONFIG)),
+        "transcribe": {"asr_engine": "xf_asr", "custom_post": {
+            "endpoint": "https://api.minimax.cn/v1/speech_to_text",
+            "api_key": "sk-cp-123456", "language": "zh", "mock": False,
+        }},
+        "ai_cover": {
+            "provider": "modelscope", "base_url": "https://api-inference.modelscope.cn/",
+            "api_key": "ms-cover-key-999", "model": "Qwen/Qwen-Image",
+            "edit_model": "Qwen/Qwen-Image-Edit-2511", "size": "1344x768",
+            "output_format": "jpg", "brand": "一览美食", "pipeline": "full",
+        },
+        "image_host": {
+            "enable": True, "provider": "easyimage",
+            "api_url": "https://img.example.com/api/index.php", "token": "tok-777",
+            "token_field": "token", "file_field": "image",
+            "url_json_path": "url", "timeout_seconds": 180, "extra_fields": {},
+        },
+    }
+    cfg_mod.load_config = lambda: json.loads(json.dumps(cfg))
+    sd_mod.load_config = lambda: json.loads(json.dumps(cfg))
+
+    d = SettingsDialog()
+    # --- 旧配置（无档案）必须能加载，四处下拉都存在且为空 ---
+    assert d.cover_model.text() == "Qwen/Qwen-Image", "封面旧配置没读出来"
+    assert d.cover_brand.text() == "一览美食"
+    assert d.host_provider.text() == "easyimage", "图床旧配置没读出来"
+    assert d.host_token.text() == "tok-777"
+    for attr in ("llm_profile_combo", "cp_profile_combo",
+                 "cover_profile_combo", "host_profile_combo"):
+        assert getattr(d, attr).count() == 0, f"{attr} 不该凭空造出档案"
+
+    # --- 四处都存一份档案 ---
+    for key, pid, label in (
+        ("llm", "l1", "主力 LLM"),
+        ("cp", "c1", "MiniMax 官方"),
+        ("cover", "v1", "ModelScope 生图"),
+        ("host", "h1", "EasyImage 图床"),
+    ):
+        spec = d._spec(key)
+        d._set_profiles(spec, [dict(spec.fields(d), id=pid, label=label)])
+
+    for attr in ("llm_profile_combo", "cp_profile_combo",
+                 "cover_profile_combo", "host_profile_combo"):
+        assert getattr(d, attr).count() == 1, f"{attr} 档案没进下拉"
+
+    # --- 写回：四处档案进各自 config 路径，且都是 list ---
+    up = d._collect_updates()
+    for path in ("llm", "transcribe.custom_post", "ai_cover", "image_host"):
+        node = up
+        for k in path.split("."):
+            node = node[k]
+        profs = node.get("profiles")
+        assert isinstance(profs, list) and len(profs) == 1, (
+            f"{path} 的 profiles 没写对（必须是 list，否则删档案会留幽灵）"
+        )
+
+    # --- 四处 Key 都没被改坏 ---
+    assert up["llm"]["api_key"] == REAL_OLD_CONFIG["api_key"]
+    assert up["transcribe"]["custom_post"]["api_key"] == "sk-cp-123456"
+    assert up["ai_cover"]["api_key"] == "ms-cover-key-999"
+    assert up["image_host"]["token"] == "tok-777"
+
+    # --- 应用封面档案能回填 ---
+    d.cover_provider.setText("CHANGED")
+    d.cover_model.setText("CHANGED")
+    d._apply_cover_profile_to_ui(d._get_profiles(d._spec("cover"))[0])
+    assert d.cover_model.text() == "Qwen/Qwen-Image", "封面档案应用失败"
+    assert d.cover_brand.text() == "一览美食"
+
+    # --- 应用图床档案能回填 ---
+    d.host_api_url.setText("CHANGED")
+    d._apply_host_profile_to_ui(d._get_profiles(d._spec("host"))[0])
+    assert d.host_api_url.text() == "https://img.example.com/api/index.php"
+
+    # --- 四处档案互不干扰 ---
+    c2 = json.loads(json.dumps(cfg))
+    c2["ai_cover"]["profiles"] = [{"id": "v1", "label": "A"}, {"id": "v2", "label": "B"}]
+    c2["llm"]["profiles"] = [{"id": "l1", "label": "X"}]
+    deep_update(c2, {"ai_cover": {"profiles": [{"id": "v1", "label": "A"}]}})
+    assert [p["id"] for p in c2["ai_cover"]["profiles"]] == ["v1"], "删封面档案没生效"
+    assert [p["id"] for p in c2["llm"]["profiles"]] == ["l1"], "删封面档案影响了 LLM"
+    print("OK 11: AI 封面 / 图床 档案区（四处并存 · Key 不坏 · 互不干扰）\n")
+
+
 def main():
     test_resolve_protocol_compat()
     test_vendor()
@@ -505,6 +657,8 @@ def main():
     test_settings_dialog()
     test_profile_manager_dialog()
     test_custom_post_profiles()
+    test_asr_engine_list_shared()
+    test_cover_and_host_profiles()
     print("=" * 50)
     print("ALL llm-settings smoke tests passed ✓")
     print("=" * 50)

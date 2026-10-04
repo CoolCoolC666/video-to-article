@@ -418,10 +418,13 @@ xf_asr 集成期间按以下顺序踩坑订正协议层（每个 fix 都加 smok
 | **旧 config 零改动兼容** | `resolve_protocol()` 有 `protocol` 就用；没有就回落到旧 `provider`；**任何无法识别的 `provider` 值一律当 `openai_chat`**<br>写盘时 `provider` 仍保留写入 | 旧配置不用改一行就能跑；兜底顺带修掉「`provider` 写个空格就整个转写挂掉」 |
 | **模型列表自动抓取** | 「⟳ 抓取」按钮 → `GET {base_url}/models`，后台线程不阻塞 UI，结果进 **Model 可编辑下拉**<br>**抓取失败绝不清空已填内容、绝不阻断保存** | Model 名（如 `MiniMax-M2.7-highspeed`）手打极易错；且不是所有 provider 都提供 `/models`，必须留手填口子 |
 | **抓取走 requests 直连而非 openai SDK** | 新增 `providers/llm_models.py`，**不用 `client.models.list()`** | 实测 `openai 3.8.0` 缺 `jiter`（`pyproject` 只声明 `openai>=1.0.0`），`client.models` 属性访问直接 `ModuleNotFoundError`；`c.chat` 懒加载所以现有转写不受影响 |
-| **多配置档案 + 右下角管理入口** | 「设置 → 转写 → 大模型」顶部档案区（应用到当前 / 存为新档案 / 管理…）<br>对话框**右下角**另有「管理配置档案…」（放在 Save/Cancel 左侧，不破坏 Save 最右的肌肉记忆）<br>管理弹窗支持重命名 / 复制 / 删除 / 排序，**不可删空** | 切厂商不用每次手打 API Key + Base URL + Model 三件套 |
+| **多配置档案（四处通用）** | 「设置」里共 4 个档案区，全部复用 `gui/profile_store.py`：<br>① 大模型 `llm.profiles` ② 自定义 POST `transcribe.custom_post.profiles`<br>③ AI 封面 `ai_cover.profiles` ④ 图床 `image_host.profiles`<br>右下角「管理配置档案…」可四选一，各 Tab 内另有「管理…」直达 | 换服务不用每次手打全套。封面常在多套生图服务间切、图床常在多套图床间切，都是高频场景 |
 | **`custom_post` 也有同一套档案** | 「设置 → 转写 → 自定义（POST）」下方独立档案区，存 `transcribe.custom_post.profiles`<br>**每个档案可指向不同的请求头文件** | 切一个云端 ASR Provider 要手打「端点 + Key + 请求头文件路径」，而不同 Provider 的鉴权方式还各不相同（Bearer / 自定义头 / 私有网关 token）——档案让它们各存各的互不干扰 |
-| **一个弹窗两处复用** | `ProfileManagerDialog` 按 `PROFILE_SPEC_LLM` / `PROFILE_SPEC_ASR` 两套字段规格渲染 | 机制完全相同（list 存储 + 模板库 + 不可删空），没必要维护两份 |
-| **档案与当前配置：8 字段为准，档案是模板库** | 改档案不自动改下方字段，需点「应用到当前」才覆盖 | 避免「以为在改档案、其实改的是当前配置」；`providers/llm.py` 一行不用改，零回归 |
+| **AI 封面 / 图床 也都有档案** | 「AI 封面」存 `ai_cover.profiles`（Provider / 模型 / Edit 模型 / brand…）<br>「图床」存 `image_host.profiles`（Provider / API URL / Token…） | 这两处本来是纯手填，每次换服务都要重打全套。封面常在多套生图服务间切（图床同理） |
+| **档案机制统一到 `gui/profile_store.py`** | `ProfileSpec`（声明存什么字段 / 存到哪 / 列表显示什么）+ `ProfileManagerDialog` + `ProfileMixin`<br>四处档案区共用同一套实现，**加第五处只需加一段声明** | 之前 LLM 与 custom_post 各手写一套 handler（260 行），必然漂移。本轮就因为引擎清单同样手写两份而出了 bug |
+| **右下角「管理配置档案…」改为四选一** | 档案区有四处后，按钮先弹选择器（大模型 / 自定义 POST / AI 封面 / 图床），各 Tab 内仍有自己的「管理…」直达 | 塞四个按钮进按钮行会破坏 Save/Cancel 的位置记忆 |
+| **⚠ ASR 引擎清单单一真源** | 新增 `gui/asr_engines.py`，settings 与「覆盖本次 ASR」两处下拉都从它读<br>含旧名归一（`minimax_asr` → `custom_post`） | **修 bug**：「覆盖本次 ASR」的下拉只列了 funasr / whisper，fork 新增的三个引擎在那儿**根本选不到**，用户只能去改全局默认——而「覆盖本次」的意义正是只改这一条 |
+| **档案与当前配置：当前字段为准，档案是模板库** | 改档案不自动改下方字段，需点「应用到当前」才覆盖 | 避免「以为在改档案、其实改的是当前配置」；`providers/llm.py` 一行不用改，零回归 |
 | **⚠ profiles 存 list 而不是 dict** | 见下方说明 | 这是本设计最容易埋雷的一处 |
 
 #### ⚠ 档案为什么必须存 list（最容易埋雷的一处）

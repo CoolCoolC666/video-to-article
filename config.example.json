@@ -79,7 +79,9 @@
     "reference_min_food_score": 0.38,
     "reference_crop_min_food_score": 0.42,
     "reference_crop_top_ratio": 0.18,
-    "reference_crop_bottom_ratio": 0.18
+    "reference_crop_bottom_ratio": 0.18,
+    "active_profile": "",
+    "profiles": []
   },
   "image_host": {
     "enable": false,
@@ -90,6 +92,8 @@
     "file_field": "image",
     "timeout_seconds": 180,
     "url_json_path": "url",
-    "extra_fields": {}
+    "extra_fields": {},
+    "active_profile": "",
+    "profiles": []
   }
 }

@@ -33,7 +33,18 @@ from ...cover import COVER_MODE_FULL, COVER_MODE_OFF, COVER_MODE_PROMPT_ONLY
 from ...paths import DATA_DIR, PROMPTS_DIR
 from ...prompts import default_article_prompt_names, list_article_prompts
 from ..theme_style import SPACE_ROW
+from ..asr_engines import ASR_ENGINE_LABELS, normalize_engine
 from .layout_utils import attach_card_skeleton, card_header
+
+# 每个引擎的参数去哪配——「覆盖本次 ASR」只覆盖引擎/模型/线程这几个，
+# 其余（Key / URL / 说话人分离等）仍在「设置」里，所以要明确告诉用户去哪改。
+_ENGINE_PARAM_HINT = {
+    "funasr": "FunASR 模型在上方填写；其余参数用「设置 → 转写 → FunASR 高级」",
+    "whisper": "Whisper 大小在上方填写；其余参数用「设置 → 转写」",
+    "qwen_asr": "Qwen3-ASR 的模型/语言/设备用「设置 → 转写 → Qwen3-ASR 高级」（不支持说话人分离）",
+    "xf_asr": "讯飞凭证 / 说话人分离 / edu 领域用「设置 → 转写 → 讯飞听见 高级」",
+    "custom_post": "自定义端点 / Key / 请求头文件用「设置 → 转写 → 自定义（POST）高级」",
+}
 
 
 def _body_box() -> tuple[QWidget, QVBoxLayout]:
@@ -250,10 +261,12 @@ class AsrOptions(CardWidget):
         form.setHorizontalSpacing(12)
         form.setVerticalSpacing(8)
         self.engine = ComboBox()
-        self.engine.addItem("FunASR")
-        self.engine.setItemData(0, "funasr")
-        self.engine.addItem("Whisper")
-        self.engine.setItemData(1, "whisper")
+        # 2026-10-04 修：这里曾只列 funasr / whisper，导致 fork 新增的三个引擎
+        # （qwen_asr / xf_asr / custom_post）在「覆盖本次 ASR」里**根本选不到**——
+        # 用户只能去设置里改全局默认。这个下拉必须与 settings 的引擎列表保持一致。
+        for label, code in ASR_ENGINE_LABELS:
+            self.engine.addItem(label)
+            self.engine.setItemData(self.engine.count() - 1, code)
         self.funasr_model = LineEdit()
         self.funasr_model.setText("sensevoice")
         self.model_size = ComboBox()
@@ -279,8 +292,8 @@ class AsrOptions(CardWidget):
         # 高级区不强制 min body / 不 stretch 抢空间
         body.setMinimumHeight(0)
 
-        footer = _footer_label("未勾选时使用设置里的默认转写参数")
-        outer = attach_card_skeleton(self, header, body, footer)
+        self._footer = _footer_label("未勾选时使用设置里的默认转写参数")
+        outer = attach_card_skeleton(self, header, body, self._footer)
         # 覆盖 Expanding，避免高级卡被无意义拉高
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -305,16 +318,30 @@ class AsrOptions(CardWidget):
             self._sync_engine_fields()
 
     def _sync_engine_fields(self) -> None:
-        is_whisper = self.engine.currentData() == "whisper"
-        self.model_size.setEnabled(self.isChecked() and is_whisper)
-        self.funasr_model.setEnabled(self.isChecked() and not is_whisper)
+        """按引擎启用对应字段。
+
+        2026-10-04：原来只有 whisper / 非-whisper 两档，现在有 5 个引擎，
+        「FunASR 模型」和「Whisper 大小」都只在对应引擎下才有意义，
+        其余三个引擎（qwen_asr / xf_asr / custom_post）两个框都该置灰。
+        """
+        on = self.isChecked()
+        code = str(self.engine.currentData() or "funasr")
+        self.funasr_model.setEnabled(on and code == "funasr")
+        self.model_size.setEnabled(on and code == "whisper")
+        self.cpu_threads.setEnabled(on)
+        # 提示当前引擎的参数去哪配——云端 / 新引擎的参数都在「设置」里
+        self._footer.setText(
+            "未勾选时使用设置里的默认转写参数"
+            if not on
+            else _ENGINE_PARAM_HINT.get(code, "")
+        )
 
     def load_from_config(self) -> None:
         try:
             cfg = (load_config() or {}).get("transcribe") or {}
         except Exception:
             cfg = {}
-        engine = str(cfg.get("asr_engine") or "funasr")
+        engine = normalize_engine(cfg.get("asr_engine") or "funasr")
         idx = self.engine.findData(engine)
         if idx >= 0:
             self.engine.setCurrentIndex(idx)

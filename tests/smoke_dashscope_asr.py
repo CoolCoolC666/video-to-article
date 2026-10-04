@@ -391,6 +391,87 @@ def test_image_host_guard():
     print("OK 6: 没配图床时给可操作的三选一提示（DashScope 硬性要公网 URL）")
 
 
+# ------------------------------------------------- 7. 占位符识别（实测踩到）
+def test_placeholder_detection():
+    # 本轮真实踩到：用户 config 里存着模板原样的中文占位域名，
+    # 非空、能过所有「有没有配」检查，一跑就变成看不懂的 punycode DNS 错。
+    placeholders = [
+        "https://你的图床域名/api/index.php",      # ← 用户真实踩到的那个
+        "https://example.com/api/index.php",
+        "https://your-domain.com/up",
+        "https://YOUR-DOMAIN.COM/up",
+        "https://your-site.com/up",
+        "https://placeholder.com/up",
+        "https://mydomain.com/up",
+        "  https://你的图床域名/api/index.php  ",   # 前后空格也认
+        "", "   ", "not-a-url", "https://",
+    ]
+    for u in placeholders:
+        assert cp._looks_like_placeholder_url(u), f"应判为占位: {u!r}"
+
+    # 真地址不能被误杀 —— path 里含中文是合法的（用户课件名几乎都是中文）
+    reals = [
+        "https://img.example.cn/upload/1-课件/a.mp3",  # host 是中文 TLD? 否 -> .cn 正常
+        "https://img.cdn.com/1-%E8%AF%BE%E4%BB%B6/a.mp3",
+        "https://i0.wp.com/picui.cn/abc.jpg",
+        "https://api.minimax.cn/v1",
+        "https://maas.qianwenaiapi.com/api/v1",
+        "https://127.0.0.1:8000/v1",
+        "https://picui.cn/upload",
+    ]
+    for u in reals:
+        assert not cp._looks_like_placeholder_url(u), f"不该误杀真地址: {u!r}"
+    print("OK 7a: 占位符识别（中文占位域名 / example.com / your-* …）不误杀真地址")
+
+    # 占位 URL 走上传时要给「是没填」而不是「DNS 坏了」的提示
+    p = os.path.join(tempfile.gettempdir(), "smoke_ds_audio2.mp3")
+    with open(p, "wb") as f:
+        f.write(b"ID3" + b"\0" * 512)
+    try:
+        cp.upload_audio_for_public_url(
+            cp.Path(p), {"api_url": "https://你的图床域名/api/index.php", "token": "x"}
+        )
+        raise SystemExit("应该抛错但没抛")
+    except RuntimeError as e:
+        msg = str(e)
+        assert "占位符" in msg, msg
+        assert "没填" in msg or "没换成真实域名" in msg, msg
+        assert "xn--" in msg, "应点明 punycode 才是根因"
+        # ⚠ 关键：别把整串占位 URL 回显到错误里，否则用户又对着一堆乱码发呆
+        assert "你的图床域名/api/index.php" not in msg, "不该回显整串占位 URL"
+    finally:
+        os.unlink(p)
+    print("OK 7b: 占位图床地址报「是没填」+ 点明 punycode 根因（不再回显整串 URL）")
+
+
+# --------------------------------------------- 8. audio_url 优先于图床（方案②）
+def test_audio_url_skips_image_host():
+    s = use(FakeSession(post_script=[
+        FakeResp(200, {"output": {"task_id": "t-direct"}}),
+    ]))
+    try:
+        # image_host_config 传垃圾也无所谓：显式给了 audio_url 就不该碰图床
+        tid = cp._dashscope_transcribe(
+            cp.Path("irrelevant.mp3"),
+            base_url=BASE, api_key="K", model="paraformer-v2",
+            language="", max_wait=60,
+            audio_url="https://cdn.example.com/1-课件/a.mp3",
+            image_host_config={"api_url": "https://你的图床域名/api/index.php"},
+        )
+    except Exception as e:
+        # 提交成功后会因缺轮询响应而失败，这里只关心它没先去找图床
+        msg = str(e)
+        assert "占位符" not in msg, f"显式给了 audio_url 还去借图床: {msg}"
+        assert "图床" not in msg, f"显式给了 audio_url 还去借图床: {msg}"
+    finally:
+        done()
+    assert s.posts and s.posts[0]["url"].endswith("/transcription"), "应直接提交任务"
+    assert s.posts[0]["json"]["input"]["file_urls"][0].endswith(
+        "/1-%E8%AF%BE%E4%BB%B6/a.mp3"
+    ), s.posts[0]["json"]["input"]["file_urls"][0]
+    print("OK 8: 显式填 audio_url 时完全跳过图床（图床是垃圾配置也不影响）")
+
+
 def main():
     test_endpoint_building()
     test_submit_body()
@@ -399,6 +480,8 @@ def main():
     test_normalize()
     test_constants()
     test_image_host_guard()
+    test_placeholder_detection()
+    test_audio_url_skips_image_host()
     print()
     print("smoke_dashscope_asr: 全部通过 ✓")
 

@@ -47,6 +47,7 @@ from ...media.custom_post_asr import (
     DEFAULT_ENDPOINT,
     HEADERS_FILENAME,
     MINIMAX_LANGUAGES,
+    _looks_like_placeholder_url,
     build_stt_endpoint,
     default_headers_file,
     write_headers_template,
@@ -131,6 +132,7 @@ _PROFILE_SPECS: dict[str, ProfileSpec] = {
             "api_style": d.cp_api_style.currentData() or "openai_compat",
             "endpoint": d.cp_endpoint.text().strip(),
             "model": d.cp_model.text().strip(),
+            "audio_url": d.cp_audio_url.text().strip(),
             "api_key": d.cp_api_key.text().strip(),
             "headers_file": d.cp_headers_file.text().strip(),
             "language": d.cp_language.currentData() or "",
@@ -363,6 +365,7 @@ class SettingsDialog(ProfileMixin, QDialog):
         self.cp_api_style.setCurrentIndex(sidx if sidx >= 0 else 0)
         self.cp_endpoint.setText(str(prof.get("endpoint") or ""))
         self.cp_model.setText(str(prof.get("model") or ""))
+        self.cp_audio_url.setText(str(prof.get("audio_url") or ""))
         self.cp_api_key.setText(str(prof.get("api_key") or ""))
         self.cp_headers_file.setText(str(prof.get("headers_file") or ""))
         li = self.cp_language.findData(str(prof.get("language") or ""))
@@ -465,6 +468,7 @@ class SettingsDialog(ProfileMixin, QDialog):
         """切 API 风格：启用/禁用该风格专属的字段，并刷新端点预览。"""
         is_ds = self.cp_api_style.currentData() == "dashscope_async"
         self.cp_model.setEnabled(is_ds)
+        self.cp_audio_url.setEnabled(is_ds)
         self.cp_speaker_count.setEnabled(is_ds and self.cp_role_separation.isChecked())
         self.cp_colloquial_proc.setEnabled(is_ds)
         self.cp_role_separation.setText(
@@ -481,6 +485,17 @@ class SettingsDialog(ProfileMixin, QDialog):
         if not base:
             self.cp_endpoint_preview.setText("（填 Base URL 后这里会显示最终请求地址）")
             return
+        if _looks_like_placeholder_url(base):
+            # ⚠ 提前预警：这类占位符真跑到转写那一步，报出来的是
+            #    'Failed to resolve xn--...'（中文域名被 punycode 编码），
+            #    看着像 DNS 故障，实质是没填 —— 在这里说出来最省事。
+            self.cp_endpoint_preview.setText(
+                "⚠ 这看起来还是模板占位符，没换成真实域名。"
+                "（中文域名会被转成 xn--… 报 DNS 错，很难看出是没填）"
+            )
+            self.cp_endpoint_preview.setStyleSheet("color: #b26a00; font-size: 11px;")
+            return
+        self.cp_endpoint_preview.setStyleSheet("color: #888; font-size: 11px;")
         try:
             url = build_stt_endpoint(base, style)
         except Exception:
@@ -984,6 +999,21 @@ class SettingsDialog(ProfileMixin, QDialog):
             "OpenAI 兼容风格下这个字段被忽略（协议里 model 由程序固定为 asr-1.0）。"
         )
 
+        # 2026-10-04：DashScope 要公网 URL，而「怎么拿到 URL」有两条路
+        # （借图床 / 手动直链）。图床没配好时这是唯一出路，所以必须能填。
+        self.cp_audio_url = QLineEdit()
+        self.cp_audio_url.setPlaceholderText("留空 = 借「设置 → 图床」中转；填了则直接用它")
+        self.cp_audio_url.setToolTip(
+            "**只 DashScope 异步需要** —— 它不接受文件上传，音频必须是公网 URL。\n\n"
+            "留空 = 程序自动把音频传到你的图床换 URL（需要先在「设置 → 图床」\n"
+            "填好真实域名并启用；只填了模板占位符会直接报出来）。\n\n"
+            "填了 = 直接用这个直链，跳过图床。适合：\n"
+            "  · 你已经手动把 mp3 传到网盘/对象存储\n"
+            "  · 固定音频反复转写（省一次上传）\n\n"
+            "⚠ 不要在这里填**本地路径**（如 E:/.../a.mp3），DashScope 拿不到。\n"
+            "⚠ URL 里的中文/空格由程序自动 percent-encode，不用手动处理。"
+        )
+
         self.cp_speaker_count = QSpinBox()
         self.cp_speaker_count.setRange(2, 100)
         self.cp_speaker_count.setValue(2)
@@ -1069,6 +1099,7 @@ class SettingsDialog(ProfileMixin, QDialog):
         mmform.addRow("接口地址（只填到 /api/v1）", self.cp_endpoint)
         mmform.addRow(self.cp_endpoint_preview)
         mmform.addRow("模型名（DashScope 必填）", self.cp_model)
+        mmform.addRow("音频直链（DashScope 用）", self.cp_audio_url)
         mmform.addRow("API Key", self.cp_api_key)
         mmform.addRow("请求头文件", self.cp_headers_row)
         mmform.addRow("语言", self.cp_language)
@@ -1086,17 +1117,19 @@ class SettingsDialog(ProfileMixin, QDialog):
         outer.addWidget(cp_prof_box)
 
         mm_tip = QLabel(
-            "💡 自定义 POST 云端 ASR（默认按 MiniMax asr-1.0 契约实现）：\n"
-            "  · 接口地址可改 → 指向私有部署 / 网关 / 任何兼容服务\n"
+            "💡 自定义 POST 云端 ASR —— 上方「API 风格」决定协议，两类完全不同：\n"
+            "  · **OpenAI 兼容**（默认，按 MiniMax asr-1.0 契约）：\n"
+            "    multipart/form-data 上传文件本体，一次请求直接返回 text + segments\n"
+            "    硬限制单请求 ≤ 500 秒 / 50 MB → 超了自动切 450 秒一段（压单声道 16kHz mp3）\n"
+            "  · **DashScope 异步**（阿里云百炼 Qwen3-ASR / Paraformer）：\n"
+            "    application/json，**音频必须是公网 URL**（不接受文件上传）\n"
+            "    流程：借图床换 URL → 提交任务 → 轮询 → 下载结果（上限 12h/2GB，不切段）\n"
+            "    ⚠ 拿 OpenAI 那套去打 DashScope 会被直接重置连接（10054），不返回可读错误\n"
+            "  · 接口地址**只填到 /api/v1**，路径由程序拼（下方有实时预览）\n"
             "  · 请求头走可编辑的 text 文件（每行 Key: Value，# 注释）\n"
             "    该文件可能含密钥，已加入 .gitignore；程序只打印键名不打印值\n"
             "  · 鉴权两处都行：API Key 输入框（Bearer）或请求头文件里写 Authorization\n"
-            "  · 请求是 multipart/form-data（与讯飞相反：讯飞必须 query string + raw body）\n"
-            "  · **默认硬限制：单请求 ≤ 500 秒 / 50 MB**，超了直接报错不截断\n"
-            "    → 程序自动切 450 秒一段并压成单声道 16kHz mp3（识别精度不受影响）\n"
-            "    → 换私有部署若限制不同，改 custom_post_asr.py 顶部 MAX_DURATION_SEC / MAX_FILE_BYTES\n"
             "  · verbose_json 才返回 segments[] + n_speakers（说话人分离 + 时间戳）\n"
-            "  · 错误体是 OpenAI 风格（400/401/402/403/404/413/422/429/500）\n"
             "  · MiniMax Key 申请：https://platform.minimax.cn/user-center/basic-information/interface-key"
         )
         mm_tip.setWordWrap(True)
@@ -1548,6 +1581,7 @@ class SettingsDialog(ProfileMixin, QDialog):
             str(ca.get("endpoint") or DEFAULT_ENDPOINT)
         )
         self.cp_model.setText(str(ca.get("model") or ""))
+        self.cp_audio_url.setText(str(ca.get("audio_url") or ""))
         try:
             self.cp_speaker_count.setValue(int(ca.get("speaker_count") or 2))
         except (TypeError, ValueError):
@@ -1669,6 +1703,7 @@ class SettingsDialog(ProfileMixin, QDialog):
             "api_style": self.cp_api_style.currentData() or "openai_compat",
             "endpoint": self.cp_endpoint.text().strip() or DEFAULT_ENDPOINT,
             "model": self.cp_model.text().strip(),
+            "audio_url": self.cp_audio_url.text().strip(),
             "api_key": self.cp_api_key.text().strip(),
             "headers_file": self.cp_headers_file.text().strip(),
             "language": self.cp_language.currentData() or "",

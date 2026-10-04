@@ -604,21 +604,99 @@ def _transcribe_one(
 # 实测确认：DashScope 的文件级 ASR **不接受文件上传**，必须是公网 URL。
 # 所以这里借项目自带的图床（config.image_host）做中转：先把音频传上去拿 URL。
 
+_IMAGE_HOST_MISSING = (
+    "DashScope 模式需要音频的公网 URL，但没配置图床。\n"
+    "三选一：\n"
+    "  ① 到「设置 → 图床」填好 api_url / token（可先点右下「管理…」旁的\n"
+    "     启用图床上传试一下能否传 mp3）\n"
+    "  ② 或自己把 mp3 传到任意公网可访问的地方，把直链填进 config 的\n"
+    "     transcribe.custom_post.audio_url（跳过图床）\n"
+    "  ③ 或改用「OpenAI 兼容」风格 + 不传音频的纯文本服务"
+)
+
+
+def _placeholder_host_hint(url: str) -> str:
+    """给占位 URL 生成一句 host 侧的说明（不回显整串 URL）。"""
+    try:
+        host = (urllib.parse.urlsplit(str(url)).hostname or "").strip()
+    except Exception:
+        return "（无法解析）"
+    if not host:
+        return "（空）"
+    if any(ord(c) > 127 for c in host):
+        return f"{host}（含中文 —— 这是占位符，没换成真实域名）"
+    return f"{host}（看着像模板/示例域名）"
+
+
+def _looks_like_placeholder_url(url: str) -> bool:
+    """判断 URL 是不是「模板里没替换的占位符」而不是真实地址。
+
+    ⚠ 这是实测踩到的坑：用户 config 里存着模板原样的
+    `https://你的图床域名/api/index.php`，非空、能通过所有「有没有配」检查，
+    于是程序去请求它 —— 而中文域名会被 requests 自动 punycode 编码成
+    `xn--6qqv7isyczza37vgq1b`，报出来一堆人看不懂的东西：
+        Failed to resolve 'xn--6qqv7isyczza37vgq1b' ([Errno 11001])
+    真正的原因只是「这个占位符没换」。
+
+    判据只认**域名部分**：URL 的 path 完全可以合法含中文。
+    """
+    raw = str(url or "").strip()
+    if not raw:
+        return True
+    try:
+        host = (urllib.parse.urlsplit(raw).hostname or "").strip()
+    except Exception:
+        return True
+    if not host:
+        return True
+    # ① 域名含非 ASCII —— 真实服务不会用中文域名，几乎必然是没替换的占位
+    if any(ord(c) > 127 for c in host):
+        return True
+    h = host.lower()
+    # ② 文档/模板里最常见的占位域名
+    if h in {
+        "example.com", "example.org", "example.net", "your-domain.com",
+        "yourdomain.com", "your-site.com", "yourdomain", "domain.com",
+        "test.com", "changeme.com", "placeholder.com", "todo.com",
+    }:
+        return True
+    # ③ your-xxx / my-domain 这类明显占位前缀
+    if h.startswith(("your-", "your_", "your.", "my-domain", "mydomain", "xxx.")):
+        return True
+    # ④ xn-- 是 punycode 前缀；若整体像一个被随机化的字符串也算可疑
+    if "xn--" in h and h.replace("-", "").replace("xn", "").replace(".", "").strip(
+        "0123456789abcdef"
+    ) == "":
+        return True
+    return False
+
+
 def upload_audio_for_public_url(audio_path: Path, image_host_config: dict) -> str:
     """把音频借图床传成公网 URL（DashScope 必需）。
 
     复用 `cover.upload_image_to_host`（本质是通用 multipart 上传，EasyImage 图床
     本身能收任意文件类型，mime 由 mimetypes 猜）。
     """
-    if not image_host_config or not image_host_config.get("api_url"):
+    api_url = str((image_host_config or {}).get("api_url") or "").strip()
+    if not image_host_config or not api_url:
+        raise RuntimeError(_IMAGE_HOST_MISSING)
+    if _looks_like_placeholder_url(api_url):
+        # ⚠ 不要把原始 URL 原样打出来——那正是报错的根源，重复一遍只会
+        # 让用户对着同一个看不懂的 punycode 字符串发呆。只说清「哪里没填」。
+        host_hint = _placeholder_host_hint(api_url)
         raise RuntimeError(
-            "DashScope 模式需要音频的公网 URL，但没配置图床。\n"
-            "二选一：\n"
-            "  ① 到「设置 → 图床」填好 api_url / token（可先点右下「管理…」旁的\n"
-            "     启用图床上传试一下能否传 mp3）\n"
-            "  ② 或改用「OpenAI 兼容」风格 + 不传音频的纯文本服务\n"
-            "  ③ 或自己把 mp3 传到任意公网可访问的地方，填进 config 的 "
-            "custom_post.audio_url"
+            "DashScope 模式需要音频的公网 URL，但图床地址还是**模板里的占位符**，"
+            "从没换成真实域名。\n"
+            f"当前 host 部分：{host_hint}\n\n"
+            "这不是网络问题 —— 那个中文占位符被自动转成了 punycode，"
+            "报出来是 'Failed to resolve xn--...'，看着像 DNS 故障，其实是没填。\n\n"
+            "三选一：\n"
+            "  ① 到「设置 → 图床」把 api_url 换成你的**真实图床地址**\n"
+            "     （EasyImage 系的接口形如 https://你的域名/api/index.php），\n"
+            "     并确认已启用\n"
+            "  ② 自己把 mp3 传到任意公网可访问处，把直链填进 config 的\n"
+            "     transcribe.custom_post.audio_url（跳过图床）\n"
+            "  ③ 改用「OpenAI 兼容」风格 + 不传音频的纯文本服务"
         )
     from ..cover import upload_image_to_host
 

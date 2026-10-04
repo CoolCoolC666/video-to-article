@@ -598,7 +598,10 @@ def test_endpoint_and_headers():
                 pass
 
         cp._cached_session = S()
+        # 2026-10-04 契约变更：端点只填到 base，路径由程序按 api_style 拼。
+        # 旧测试期望「填什么打什么」，现已不成立。
         custom_url = "https://my-asr.internal/v1/stt"
+        expect_url = "https://my-asr.internal/v1/stt/speech_to_text"
         try:
             cp._transcribe_one(
                 cp.Path(audio), "KEY", "", False, False, 60,
@@ -607,8 +610,8 @@ def test_endpoint_and_headers():
         finally:
             cp._release_cached_session()
             os.unlink(audio)
-        assert seen["url"] == custom_url, (
-            f"应打自定义端点，实得 {seen['url']!r}（说明 endpoint 没生效）"
+        assert seen["url"] == expect_url, (
+            f"应把 base 拼成完整转写路径，实得 {seen['url']!r}"
         )
         assert seen["headers"].get("X-Deploy-Token") == "secret-token-value", (
             f"自定义请求头应真的发出去: {seen['headers']!r}"
@@ -618,7 +621,17 @@ def test_endpoint_and_headers():
         )
         # 敏感值绝不能进日志（这里只验证代码里没把它格式化进 msg——靠 review）
         assert "secret-token-value" not in repr(sorted(seen["headers"])), "键名列表不该含值"
-        print("OK 9c: 端点可配 + 自定义请求头真的发出去")
+        print("OK 9c: base 自动拼路径 + 自定义请求头真的发出去")
+
+        # 9c-2: 防御性——万一用户已经把完整路径填进去了，不能拼成
+        # /speech_to_text/speech_to_text
+        assert cp.build_stt_endpoint(expect_url) == expect_url, (
+            f"已填完整路径应原样保留，实得 {cp.build_stt_endpoint(expect_url)!r}"
+        )
+        assert cp.build_stt_endpoint(custom_url + "/") == expect_url, (
+            "结尾多一个斜杠也应归一"
+        )
+        print("OK 9c-2: 已填完整路径 / 多余斜杠都不会重复拼接")
 
         # === 9d: 端点格式预检：非 http 开头要早报错 ===
         try:

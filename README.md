@@ -212,10 +212,13 @@ python packaging/make_models_funasr_zip.py
 | `funasr` | 本地 | 受本机算力 | 本地切段（无限制） | ✅ 挂 CAM++（约 28MB） | 无 | — |
 | `qwen_asr` | 本地 | 受显存 | **必须切**（>7.5min 切 5min） | ❌ 不支持 | 无 | — |
 | `xf_asr`（讯飞） | 云端 | **5 小时 / 500MB** | **不切段**（整段直传） | ✅ 云端 `roleType` | APPID + SecretKey | ❌ |
-| `custom_post` | 云端/自建 | **默认 500 秒 / 50MB** | **必须切**（>450s 切 450s） | ✅ `verbose_json` | API Key 或请求头文件 | ✅ **可配** |
+| `custom_post`<br>· OpenAI 兼容 | 云端/自建 | **500 秒 / 50MB** | **必须切**（>450s 切 450s） | ✅ `verbose_json` | API Key 或请求头文件 | ✅ **可配** |
+| `custom_post`<br>· DashScope 异步 | 云端 | **12 小时 / 2GB** | **不切段**（整段直传） | ✅ `diarization_enabled` | API Key 或请求头文件 | ✅ **可配** |
 
 > ⚠ **切段策略不能按「本地 / 云端」二分**，必须看每个引擎的**真实上限**。
 > 讯飞和 `custom_post` 都是云端，但默认上限差了 8 倍（5 小时 vs 500 秒），策略完全相反。
+> 同一个 `custom_post` 引擎内部还有两种风格（500 秒 vs 12 小时，差 86 倍），
+> 所以**切段阈值也是按风格分开取值的**（`MAX_DURATION_SEC` vs `DASHSCOPE_MAX_DURATION_SEC`）。
 
 ### 新增：自定义 POST 云端识别（custom_post）
 
@@ -228,6 +231,50 @@ fork **新增** `src/video_to_article/media/custom_post_asr.py`。最初是「Mi
 鉴权       Authorization: Bearer <API Key>     ← 也可改在请求头文件里
 附加请求头  从程序内 custom_post_headers.txt 读  ← 用户可直接编辑
 ```
+
+⚠ **同一个框要接两类协议完全不同的服务**，所以 2026-10-04 加了「API 风格」下拉：
+
+| 风格 | 协议 | 音频怎么送 | 单请求上限 |
+|------|------|-----------|-----------|
+| **OpenAI 兼容**（默认） | `multipart/form-data` **上传文件本体**，一次请求直接返回 `text` + `segments` | 上传 | 500 秒 / 50 MB |
+| **DashScope 异步** | `application/json`，**音频必须是公网 URL**（不接受文件上传） | 借图床中转拿 URL | 12 小时 / 2 GB |
+
+> **填错风格的典型症状**：拿 OpenAI 兼容那套（multipart + 完整路径）去打 DashScope，
+> 会直接被服务端**重置连接**（实测 `ConnectionResetError 10054`），不返回任何可读错误。
+
+#### DashScope 异步（阿里云百炼 Qwen3-ASR / Paraformer）
+
+```
+提交      POST {base}/services/audio/asr/transcription   （X-DashScope-Async: enable）
+轮询      GET  {base}/tasks/{task_id}
+结果      output.results[].transcription_url  →  下载 JSON（24 小时有效）
+```
+
+| 改动 | 内容 | 为什么改 |
+|------|------|----------|
+| **借图床换公网 URL** | `upload_audio_for_public_url()` 复用 `cover.upload_image_to_host`（通用 multipart，EasyImage 能收 mp3）；没配图床时给**三选一**可操作提示 | DashScope 文件级 ASR **硬性要求公网 URL**，不接受文件上传 |
+| **URL 必须 percent-encode** | `urllib.parse.quote(safe=":/?#[]@!$&'()*+,;=")` | 官方明确警告：不编码会报 `InvalidFile.DownloadFailed`。用户的课件文件名几乎都是中文+空格 |
+| **三步状态机** | 提交 → 轮询 → 下载；轮询**用 GET**（官方 Python 示例是 POST，已用 GET 实测兼容） | 长音频异步返回，避免单连接长挂 |
+| **⚠ 整体成功但子任务失败** | 单独检查 `results[].subtask_status` | 官方明确：整体 `SUCCEEDED` 时子任务**仍可能 `FAILED`**。不查就会拿着一个不存在的 URL 去下载 |
+| **毫秒 → 秒** | `begin_time`/`end_time` 官方单位是**毫秒**，归一时 `/1000` | 与 OpenAI 兼容风格的**秒**相反，混用会让时间轴差 1000 倍 |
+| **`language_hints` 只给 paraformer** | 模型名含 `paraformer` 才下发 | 其他模型传了会 400 |
+| **参数条件分支** | `channel_id:[0]`（多声道会分别计费）<br>`diarization_enabled` / `speaker_count`(2-100) / `disfluency_removal_enabled` | 都取自官方「任务提交接口」文档 |
+| **内联结果兜底** | 无 `transcription_url` 但有 `output.transcription` → 走 `inline:` 前缀 | 有些部署直接内联返回 |
+| **GUI 端点实时预览** | 填 Base URL 后下方实时显示 `→ 实际请求：https://...` | 解决「URL 到底填到哪一层」的困惑（**只填到 `/api/v1`**，路径由程序拼） |
+| **拼路径有防御** | `build_base()` 会剥掉已填的尾部路径 | 填了完整路径也不会拼成 `/speech_to_text/speech_to_text` |
+| **分风格切段** | DashScope 走 12h/2GB 阈值，**实际不切段** | 500s 阈值对 DashScope 是错的 |
+
+**模型名**（DashScope 必填，OpenAI 兼容风格下该字段被忽略）：
+
+```
+paraformer-v2                        通用，支持 language_hints + 说话人分离
+qwen3-asr-flash-filetrans            Qwen3，异步
+qwen-audio-3.1-asr-flash-filetrans   Qwen-Audio，异步
+```
+
+> ⚠ **开了说话人分离后，官方建议音频不超过 2 小时**，否则可能失败或超时
+> （`diarization_enabled` 本身仅支持**单声道**）。
+> `speaker_count` 只是「尽量输出这个人数」的提示，**不保证**一定输出。
 
 | 改动 | 内容 | 为什么改 |
 |------|------|----------|
@@ -459,9 +506,9 @@ for key, value in updates.items():
 
 ### 测试 / 工程
 
-- **11 个 smoke 脚本移到 `tests/`**（`smoke_settings / fallback / language / jp_kr / release / cleanup / thinking / xf_asr / xf_e2e / funasr_speaker / custom_post_asr`）
-  - 验证 GUI 字段读写、device fallback、language 兜底、释放按钮、清理按钮、xf_asr 鉴权签名 / upload 协议 / poll 状态码 / orderResult 解析 / 说话人分离 / 增强参数降级、FunASR CAM++ 模型解析 / sentence_info 格式化 / 富标签剥离、custom_post 协议契约 / 切段阈值 / 跨段偏移 / 错误码 / 端点可配 / 请求头文件解析 / 旧名兼容 / 五处注册点
-  - 11 套全过，共 100+ 断言
+- **14 个 smoke 脚本在 `tests/`**（`smoke_settings / fallback / language / jp_kr / release / cleanup / thinking / xf_asr / xf_e2e / funasr_speaker / custom_post_asr / dashscope_asr / llm_settings / bilibili_parse`）
+  - 验证 GUI 字段读写、device fallback、language 兜底、释放按钮、清理按钮、xf_asr 鉴权签名 / upload 协议 / poll 状态码 / orderResult 解析 / 说话人分离 / 增强参数降级、FunASR CAM++ 模型解析 / sentence_info 格式化 / 富标签剥离、custom_post 协议契约 / 切段阈值 / 跨段偏移 / 错误码 / 端点可配 / 请求头文件解析 / 旧名兼容 / 五处注册点、**DashScope 提交体 / URL 编码 / 轮询状态机 / subtask_status / 毫秒转秒**、LLM 档案、av↔BV 互转
+  - 14 套全过，共 140+ 断言
   - `tests/README.md` 说明运行方式（从仓库根跑）
 - **`.gitignore` 加严**：
   - 新增 `pip-unpack-*/` `run_e2e_main.log` `__tmp_*` `*.bak` `config.json.bak*`

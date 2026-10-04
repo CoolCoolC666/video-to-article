@@ -86,12 +86,13 @@ import shutil
 import subprocess
 import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from ..logging_config import configure_logging
 from ..paths import APP_ROOT
-from ..text_utils import format_time
+from ..text_utils import format_time, import_required
 
 logger = configure_logging()
 
@@ -104,15 +105,42 @@ _MODEL = "asr-1.0"
 # 请求头文件：程序内，默认文件名。用戶可直接编辑（每行一条 Key: Value）
 HEADERS_FILENAME = "custom_post_headers.txt"
 
-# === 硬限制（针对 MiniMax 默认值；换私有部署可改这里）===
+# ============ API 风格（2026-10-04 新增）============
+# 同一个「自定义 POST」框要接两类**协议完全不同**的服务，所以必须显式选风格。
+# 不是「换个 URL」那么简单——请求体、鉴权、音频传递方式、拿结果的方式全都不同。
+#   2026-10-04 实测：往 DashScope 走 OpenAI 兼容的 multipart，会被中间层断连（10054）。
+API_STYLES = {
+    "openai_compat": "OpenAI 兼容（MiniMax / 中转 / vLLM 等）",
+    "dashscope_async": "DashScope 异步（阿里云百炼 Qwen3-ASR）",
+}
+
+# ---------- 风格 openai_compat：一次性 multipart 上传，直接返回结果 ----------
+OPENAI_COMPAT_PATH = "/speech_to_text"
+# 单请求 ≤ 500 秒 / 50 MB（OpenAI 兼容侧 OpenAPI 明确写出）
 MAX_DURATION_SEC = 500     # 时长上限，超了 400
 MAX_FILE_BYTES = 50 * 1024 * 1024  # 大小上限，超了 413
-
-# 切段策略：留 50 秒余量给 ffprobe 误差 + 服务端宽容度
-# 绝不能卡着 500s 切 —— 探测值略偏就会 400
+# 切段留 50 秒余量：ffprobe 探测有误差，卡着 500s 切必 400
 CHUNK_SEGMENT_SEC = 450
 
-# 支持的音频格式（OpenAPI 列的）
+# ---------- 风格 dashscope_async：提交任务 → 轮询 → 下载结果 ----------
+# 官方文档（2026-10-04 查证并实测确认）：
+#   POST {base}/services/audio/asr/transcription
+#     Header: Authorization: Bearer <key>  +  X-DashScope-Async: enable
+#     Body:   application/json（**不是 multipart**）
+#            {"model": "...", "input": {"file_urls": ["<公网URL>"]},
+#             "parameters": {"channel_id": [0], "language_hints": ["zh","en"]}}
+#   GET  {base}/tasks/{task_id}   → output.results[].transcription_url
+#   GET  {transcription_url}      → 完整结果 JSON（24 小时有效，务必及时下载）
+# ⚠ 关键约束：**音频必须是公网 URL**，不接受文件上传。本模块靠图床中转拿 URL。
+DASHSCOPE_TASK_PATH = "/services/audio/asr/transcription"
+# 异步转写支持单文件 12 小时 / 2 GB —— 比 OpenAI 兼容宽松得多，基本不需要切段
+DASHSCOPE_MAX_DURATION_SEC = 12 * 3600
+DASHSCOPE_MAX_BYTES = 2 * 1024 * 1024 * 1024
+DASHSCOPE_POLL_INTERVAL = 5.0
+DASHSCOPE_DONE = {"SUCCEEDED", "SUCCESS", "COMPLETED", "DONE"}
+DASHSCOPE_FAILED = {"FAILED", "CANCELED", "CANCELLED", "UNKNOWN"}
+
+# 支持的音频格式（OpenAI 兼容侧 OpenAPI 列的）
 SUPPORTED_EXTS = {".wav", ".aiff", ".aif", ".flac", ".alac", ".m4a",
                   ".mp3", ".aac", ".opus", ".ogg"}
 
@@ -168,7 +196,6 @@ _cached_session: Optional[object] = None
 
 
 # ============ 请求头文件 ============
-
 def default_headers_file() -> Path:
     """程序内默认请求头文件路径（与 exe / 源码同目录）。"""
     return Path(APP_ROOT) / HEADERS_FILENAME
@@ -488,6 +515,36 @@ def _extract_error(resp, url: str = "") -> str:
     return " | ".join(parts)
 
 
+def build_base(base_url: str) -> str:
+    """把用户填的「接口地址」归一成 base（去结尾斜杠 + 去尾部已知路径）。
+
+    用户最容易填错的就是这一层——GUI 里也提示「只填到 /api/v1」。
+    这里做防御性清洗：万一填了完整路径，也认得出来，
+    不会拼成 /speech_to_text/speech_to_text 这种鬼东西。
+    """
+    base = str(base_url or "").strip().rstrip("/")
+    for suffix in (OPENAI_COMPAT_PATH, DASHSCOPE_TASK_PATH, "/models"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+    return base
+
+
+def build_stt_endpoint(base_url: str, style: str = "openai_compat") -> str:
+    """拼出实际调用的转写端点。GUI 用它做实时预览。"""
+    base = build_base(base_url)
+    if not base:
+        return ""
+    if style == "dashscope_async":
+        return f"{base}{DASHSCOPE_TASK_PATH}"
+    return f"{base}{OPENAI_COMPAT_PATH}"
+
+
+def build_task_query_url(base_url: str, task_id: str) -> str:
+    """拼任务查询端点（只有 dashscope_async 用）。"""
+    base = build_base(base_url)
+    return f"{base}/tasks/{task_id}" if base else ""
+
+
 def _transcribe_one(
     audio_path: Path,
     api_key: str,
@@ -507,7 +564,8 @@ def _transcribe_one(
     need_verbose = bool(role_separation or timestamps)
     response_format = "verbose_json" if need_verbose else "json"
 
-    url = (endpoint or DEFAULT_ENDPOINT).strip() or DEFAULT_ENDPOINT
+    # 统一走 build_stt_endpoint：填完整路径也能归一，不会拼出 /speech_to_text/speech_to_text
+    url = build_stt_endpoint(endpoint, "openai_compat")
     headers = build_headers(api_key, language, extra_headers)
 
     data = {
@@ -542,6 +600,323 @@ def _transcribe_one(
         ) from exc
 
 
+# ============ DashScope 异步流程（2026-10-04 新增）============
+# 实测确认：DashScope 的文件级 ASR **不接受文件上传**，必须是公网 URL。
+# 所以这里借项目自带的图床（config.image_host）做中转：先把音频传上去拿 URL。
+
+def upload_audio_for_public_url(audio_path: Path, image_host_config: dict) -> str:
+    """把音频借图床传成公网 URL（DashScope 必需）。
+
+    复用 `cover.upload_image_to_host`（本质是通用 multipart 上传，EasyImage 图床
+    本身能收任意文件类型，mime 由 mimetypes 猜）。
+    """
+    if not image_host_config or not image_host_config.get("api_url"):
+        raise RuntimeError(
+            "DashScope 模式需要音频的公网 URL，但没配置图床。\n"
+            "二选一：\n"
+            "  ① 到「设置 → 图床」填好 api_url / token（可先点右下「管理…」旁的\n"
+            "     启用图床上传试一下能否传 mp3）\n"
+            "  ② 或改用「OpenAI 兼容」风格 + 不传音频的纯文本服务\n"
+            "  ③ 或自己把 mp3 传到任意公网可访问的地方，填进 config 的 "
+            "custom_post.audio_url"
+        )
+    from ..cover import upload_image_to_host
+
+    result = upload_image_to_host(audio_path, image_host_config)
+    url = str((result or {}).get("url") or "")
+    if not url:
+        raise RuntimeError(f"图床上传成功但没拿到 URL: {result}")
+    logger.info(f"音频已借图床转为公网 URL: {url}")
+    return url
+
+
+def _dashscope_headers(api_key: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    headers = {"Authorization": f"Bearer {api_key}", "X-DashScope-Async": "enable"}
+    for k, v in (extra or {}).items():
+        if v:
+            headers[k] = v
+    return headers
+
+
+def _dashscope_submit(
+    base_url: str,
+    api_key: str,
+    model: str,
+    audio_url: str,
+    language: str,
+    extra_headers: Optional[Dict[str, str]] = None,
+    role_separation: bool = False,
+    speaker_count: int = 2,
+    colloquial_proc: bool = False,
+) -> str:
+    """提交异步转写任务，返回 task_id。
+
+    parameters 字段全部来自官方「任务提交接口」文档（2026-10-04 查证）：
+      channel_id                  音轨索引（多声道会**分别计费**，默认只取 [0]）
+      language_hints              仅 paraformer-v2 支持；其他模型传了可能报错
+      diarization_enabled         自动说话人分离；**仅单声道**，多声道不支持
+      speaker_count               说话人数参考值（2-100），只是提示不保证
+      disfluency_removal_enabled  过滤语气词（嗯/啊/呃）——等价于 xf_asr 的口语规整
+    """
+    requests = import_required("requests", "requests")
+    session = _get_session()
+    url = build_stt_endpoint(base_url, "dashscope_async")
+    if not model:
+        raise RuntimeError(
+            "DashScope 模式必须填模型名（如 paraformer-v2 / qwen3-asr-flash-filetrans / "
+            "qwen-audio-3.1-asr-flash-filetrans）。"
+        )
+    # 官方明确警告：URL 含空格/中文必须先 percent-encode，
+    # 否则报 InvalidFile.DownloadFailed。用户的课件文件名几乎都是中文。
+    safe_url = urllib.parse.quote(audio_url, safe=":/?#[]@!$&'()*+,;=")
+
+    params: Dict[str, object] = {"channel_id": [0]}
+    if language and "paraformer" in str(model).lower():
+        # language_hints 只对 paraformer-v2 系列有效，其他模型传了会 400
+        params["language_hints"] = [language]
+    if colloquial_proc:
+        params["disfluency_removal_enabled"] = True
+    if role_separation:
+        params["diarization_enabled"] = True
+        if 2 <= int(speaker_count or 2) <= 100:
+            params["speaker_count"] = int(speaker_count)
+
+    body = {
+        "model": model,
+        "input": {"file_urls": [safe_url]},
+        "parameters": params,
+    }
+    logger.info(
+        f"提交 DashScope 异步任务: {url}\n"
+        f"  model={model}  分离={bool(role_separation)}  人数={speaker_count}\n"
+        f"  音频 URL={safe_url[:110]}"
+    )
+    resp = session.post(
+        url, headers=_dashscope_headers(api_key, extra_headers), json=body, timeout=60
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(_extract_error(resp, url))
+    payload = resp.json()
+    task_id = str(((payload or {}).get("output") or {}).get("task_id") or "")
+    if not task_id:
+        raise RuntimeError(f"DashScope 没返回 task_id: {str(payload)[:300]}")
+    logger.info(f"任务已提交: {task_id}")
+    return task_id
+
+
+def _dashscope_poll(
+    base_url: str,
+    api_key: str,
+    task_id: str,
+    max_wait: int,
+    extra_headers: Optional[Dict[str, str]] = None,
+) -> str:
+    """轮询任务直到完成，返回 transcription_url。"""
+    requests = import_required("requests", "requests")
+    session = _get_session()
+    url = build_task_query_url(base_url, task_id)
+    deadline = time.time() + max_wait
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        resp = session.get(
+            url, headers=_dashscope_headers(api_key, extra_headers), timeout=30
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(_extract_error(resp, url))
+        payload = resp.json() or {}
+        out = payload.get("output") or {}
+        status = str(out.get("task_status") or "").upper()
+        if status in DASHSCOPE_DONE:
+            # ⚠ 官方明确：整体 SUCCEEDED 时**子任务仍可能 FAILED**，
+            #    必须看 results[].subtask_status，否则会拿着一个不存在的 URL 去下载。
+            results = out.get("results") or []
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                sub = str(item.get("subtask_status") or "SUCCEEDED").upper()
+                if sub != "SUCCEEDED":
+                    code = item.get("code") or ""
+                    msg = item.get("message") or ""
+                    hint = ""
+                    if code == "InvalidFile.DownloadFailed":
+                        hint = (
+                            "\n常见原因：音频 URL 里有中文/空格没编码好，或图床不允许外网访问。"
+                        )
+                    raise RuntimeError(
+                        f"DashScope 子任务失败（{sub}，code={code}）: {msg}{hint}"
+                    )
+                link = str(item.get("transcription_url") or "").strip()
+                if link:
+                    logger.info(f"任务完成（第 {attempt} 次轮询），结果链接已拿到")
+                    return link
+            inline = out.get("transcription")
+            if inline:
+                logger.info("任务完成且结果内联，无需二次下载")
+                return f"inline:{json.dumps(inline, ensure_ascii=False)}"
+            raise RuntimeError(
+                f"任务状态是 {status}，但结果里既没有 transcription_url 也没有内联内容: "
+                f"{str(payload)[:300]}"
+            )
+        if status in DASHSCOPE_FAILED:
+            raise RuntimeError(
+                f"DashScope 任务失败（status={status}）: {str(payload)[:300]}"
+            )
+        logger.info(f"轮询 #{attempt}: status={status or 'PENDING'}")
+        time.sleep(DASHSCOPE_POLL_INTERVAL)
+    raise RuntimeError(
+        f"DashScope 任务轮询超时（>{max_wait}s, {attempt} 次），task_id={task_id}"
+    )
+
+
+def _dashscope_download(link: str, timeout: int = 120) -> dict:
+    """下载 transcription_url 指向的结果 JSON（24 小时有效，务必及时取）。"""
+    requests = import_required("requests", "requests")
+    session = _get_session()
+    if link.startswith("inline:"):
+        return json.loads(link[len("inline:"):])
+    resp = session.get(link, timeout=timeout)
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"下载转写结果失败 HTTP {resp.status_code}: {link[:120]}"
+        )
+    try:
+        return resp.json()
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"转写结果不是 JSON（链接可能已过期 24h）: {link[:120]}"
+        ) from exc
+
+
+def _dashscope_transcribe(
+    audio_path: Path,
+    base_url: str,
+    api_key: str,
+    model: str,
+    language: str,
+    max_wait: int,
+    audio_url: str = "",
+    image_host_config: Optional[dict] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
+    role_separation: bool = False,
+    speaker_count: int = 2,
+    colloquial_proc: bool = False,
+) -> dict:
+    """DashScope 异步转写全流程：拿 URL → 提交 → 轮询 → 下载。
+
+    Returns:
+        归一化成 {text, segments(秒), n_speakers} 的 dict，交给 _format_segments 用。
+    """
+    url = audio_url or upload_audio_for_public_url(audio_path, image_host_config or {})
+    task_id = _dashscope_submit(
+        base_url, api_key, model, url, language, extra_headers,
+        role_separation=role_separation,
+        speaker_count=speaker_count,
+        colloquial_proc=colloquial_proc,
+    )
+    link = _dashscope_poll(base_url, api_key, task_id, max_wait, extra_headers)
+    payload = _dashscope_download(link)
+    return _normalize_dashscope_result(payload)
+
+
+def _normalize_dashscope_result(payload) -> dict:
+    """把 DashScope 结果 JSON 归一成 {text, segments, n_speakers}（**秒**）。
+
+    schema 依据官方「识别结果说明」（2026-10-04 查证原文）：
+
+        {"file_url": ..., "properties": {...},
+         "transcripts": [{
+            "channel_id": 0,
+            "content_duration_in_milliseconds": 3720,
+            "text": "整段文本",
+            "sentences": [
+               {"begin_time": 100, "end_time": 3820,   <-- 毫秒
+                "text": "...", "sentence_id": 1,
+                "speaker_id": 0,                     <-- 仅开启说话人分离时才有
+                "words": [...]}
+            ]}]}
+
+    三处最容易踩的：
+      1. 顶层是 transcripts[]，sentences 在里面一层
+      2. **时间戳单位是毫秒**（官方原文 "Timestamps are in milliseconds"），
+         归一时统一除 1000 转成秒。否则 3.2 秒会被显示成 53 分 20 秒。
+      3. speaker_id **只在开了 diarization_enabled 时返回**
+    """
+    if isinstance(payload, str):
+        return {"text": payload, "segments": [], "n_speakers": 0}
+    if not isinstance(payload, dict):
+        return {"text": str(payload), "segments": [], "n_speakers": 0}
+
+    sentences: list = []
+    plain = ""
+    for tr in (payload.get("transcripts") or []):
+        if not isinstance(tr, dict):
+            continue
+        if not plain:
+            plain = str(tr.get("text") or "").strip()
+        for sent in (tr.get("sentences") or []):
+            if isinstance(sent, dict):
+                sentences.append(sent)
+
+    # 兜底：某些部署可能直接给 sentences / 顶层 text
+    if not sentences:
+        for key in ("sentences", "sentences_list", "segments", "sentence_info"):
+            v = payload.get(key)
+            if isinstance(v, list) and v:
+                sentences = [x for x in v if isinstance(x, dict)]
+                break
+    if not plain:
+        for src in (payload, payload.get("output") or {}):
+            for key in ("text", "transcription", "content"):
+                v = src.get(key) if isinstance(src, dict) else None
+                if isinstance(v, str) and v.strip():
+                    plain = v.strip()
+                    break
+            if plain:
+                break
+
+    def _sec(item, *keys) -> float:
+        """取毫秒字段并转成秒。"""
+        for k in keys:
+            if item.get(k) is not None:
+                try:
+                    return float(item[k]) / 1000.0
+                except (TypeError, ValueError):
+                    continue
+        return 0.0
+
+    segments = []
+    for sent in sentences:
+        text = str(
+            sent.get("text") or sent.get("sentence") or sent.get("content") or ""
+        ).strip()
+        if not text:
+            continue
+        spk = sent.get("speaker_id")
+        if spk in (None, ""):
+            for k in ("speaker", "spk", "speakerId", "role_id"):
+                if sent.get(k) not in (None, ""):
+                    spk = sent.get(k)
+                    break
+        segments.append({
+            "text": text,
+            "start": _sec(sent, "begin_time", "start_time", "begin", "start", "offset"),
+            "end": _sec(sent, "end_time", "end"),
+            "speaker": (f"spk{spk}" if spk not in (None, "") else ""),
+        })
+
+    if not plain and segments:
+        plain = "".join(s["text"] for s in segments)
+    if not plain and not segments:
+        raise RuntimeError(
+            "认不出 DashScope 返回结果的结构（可能该部署用别的字段名）。"
+            f"顶层键: {sorted(payload)[:12]}"
+        )
+    speakers = {s["speaker"] for s in segments if s["speaker"]}
+    return {"text": plain, "segments": segments, "n_speakers": len(speakers)}
+
+
+
 # ============ 响应解析 ============
 
 def _format_ts(sec: float) -> str:
@@ -563,7 +938,12 @@ def _format_segments(
     time_offset: float = 0.0,
     speaker_offset: Optional[dict] = None,
 ) -> List[str]:
-    """把 verbose_json 的 segments[] 格式化成行。
+    """把 segments[]（或 DashScope 归一后的同构 dict）格式化成行。
+
+    DashScope 那条路经 `_normalize_dashscope_result` 归一后，
+    segments 项的键是 text / start / end / speaker（**秒**），
+    与这里的 OpenAI 兼容形态不同，故先按是否已有 start 判定。
+    两种形态字段名基本同名（speaker vs 无），见下方取值优先级。
 
     Args:
         time_offset:     段起始时间偏移（秒）—— 切段后每段 start 都从 0 重新计
@@ -674,12 +1054,33 @@ def transcribe_audio_with_custom_post(audio_path: str, config: dict) -> str:
     role_separation = bool(cfg.get("role_separation", False))
     timestamps = bool(cfg.get("timestamps", True))
     max_wait = int(cfg.get("max_wait_seconds") or 300)
+    # 2026-10-04 新增：API 风格 + DashScope 专用字段
+    api_style = str(cfg.get("api_style") or "openai_compat").strip()
+    if api_style not in API_STYLES:
+        logger.warning(
+            f"未知的 API 风格 {api_style!r}，回落到 openai_compat"
+            f"（可选：{list(API_STYLES)}）"
+        )
+        api_style = "openai_compat"
+    model = str(cfg.get("model") or "").strip()
+    audio_url = str(cfg.get("audio_url") or "").strip()
+    # DashScope 要公网 URL：优先用户直填，其次借图床中转
+    image_host_config: Optional[dict] = None
+    if api_style == "dashscope_async" and not audio_url:
+        try:
+            from ..config import load_config
+
+            image_host_config = (load_config() or {}).get("image_host") or {}
+        except Exception as e:
+            logger.warning(f"读图床配置失败（DashScope 模式需要）: {e}")
 
     # 请求头文件：留空用程序内默认文件
     headers_path_raw = (cfg.get("headers_file") or "").strip()
     headers_path = Path(headers_path_raw) if headers_path_raw else default_headers_file()
     # 不存在会自动生成模板
     extra_headers = load_headers_file(headers_path)
+    if extra_headers and api_style == "dashscope_async":
+        logger.info("DashScope 模式也会带上请求头文件里的自定义头")
 
     # 凭证可以来自两处：API Key 输入框，或请求头文件里的 Authorization。
     # 后者支持非 Bearer 鉴权（私有部署常见），所以空 API Key 不等于没凭证。
@@ -710,9 +1111,14 @@ def transcribe_audio_with_custom_post(audio_path: str, config: dict) -> str:
 
     # 端点格式预检：早点报，比服务端 404 好查
     if not endpoint.lower().startswith(("http://", "https://")):
+        hint = (
+            f"DashScope 示例: https://dashscope.aliyuncs.com/api/v1"
+            if api_style == "dashscope_async"
+            else f"MiniMax 官方示例: {DEFAULT_ENDPOINT}"
+        )
         raise RuntimeError(
-            f"接口地址必须以 http:// 或 https:// 开头，实得: {endpoint!r}。"
-            f"默认 MiniMax 官方地址是 {DEFAULT_ENDPOINT}"
+            f"接口地址必须以 http:// 或 https:// 开头，实得: {endpoint!r}。\n"
+            f"⚠ 只填到「/api/v1」这一层，后面的路径程序自己拼。{hint}"
         )
 
     # 格式预检：裸 PCM 会被 400 拒，MP4/MKV 这类容器也不支持
@@ -722,6 +1128,40 @@ def transcribe_audio_with_custom_post(audio_path: str, config: dict) -> str:
             f"文件后缀 {ext} 不在支持列表（{'/'.join(sorted(SUPPORTED_EXTS))}）——"
             "若报 400 请先转成 mp3/wav（程序下载音轨时默认就是 mp3）"
         )
+
+    # ===== DashScope 异步：单独一条路（音频必须先变成公网 URL）=====
+    if api_style == "dashscope_async":
+        if not model:
+            raise RuntimeError(
+                "DashScope 模式必须填「模型名」（如 qwen3-asr-flash-filetrans / "
+                "qwen-audio-3.1-asr-flash-filetrans / paraformer-v2）。\n"
+                "在「设置 → 转写 → 自定义（POST）高级 → 模型名」填写。"
+            )
+        t0 = time.time()
+        result = _dashscope_transcribe(
+            audio_path_obj,
+            base_url=endpoint,
+            api_key=api_key,
+            model=model,
+            language=language,
+            max_wait=max_wait,
+            audio_url=audio_url,
+            image_host_config=image_host_config,
+            extra_headers=extra_headers,
+            role_separation=role_separation,
+            speaker_count=int(cfg.get("speaker_count") or 2),
+            colloquial_proc=bool(cfg.get("colloquial_proc", False)),
+        )
+        text = _assemble(
+            [result], role_separation, timestamps,
+            chunk_durations=[duration if duration > 0 else 0.0],
+        )
+        logger.info(
+            f"DashScope 转写完成 (耗时: {format_time(time.time() - t0)}，"
+            f"共 {len(text)} 字符)"
+        )
+        _release_cached_session()
+        return text
 
     start = time.time()
     duration = _probe_audio_duration(audio_path_obj)

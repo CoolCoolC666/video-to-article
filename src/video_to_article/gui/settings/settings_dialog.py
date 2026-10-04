@@ -43,9 +43,11 @@ from ...cover import (
 )
 from ...media.xf_asr import PD_DOMAINS
 from ...media.custom_post_asr import (
+    API_STYLES,
     DEFAULT_ENDPOINT,
     HEADERS_FILENAME,
     MINIMAX_LANGUAGES,
+    build_stt_endpoint,
     default_headers_file,
     write_headers_template,
 )
@@ -126,13 +128,17 @@ _PROFILE_SPECS: dict[str, ProfileSpec] = {
             "若两个 Provider 用不同的请求头文件，记得复制后改一下路径。"
         ),
         fields=lambda d: {
+            "api_style": d.cp_api_style.currentData() or "openai_compat",
             "endpoint": d.cp_endpoint.text().strip(),
+            "model": d.cp_model.text().strip(),
             "api_key": d.cp_api_key.text().strip(),
             "headers_file": d.cp_headers_file.text().strip(),
             "language": d.cp_language.currentData() or "",
             "mock": d.cp_mock.isChecked(),
             "role_separation": d.cp_role_separation.isChecked(),
+            "speaker_count": d.cp_speaker_count.value(),
             "timestamps": d.cp_timestamps.isChecked(),
+            "colloquial_proc": d.cp_colloquial_proc.isChecked(),
             "max_wait_seconds": d.cp_max_wait.value(),
         },
         apply=lambda d, p: d._apply_cp_profile_to_ui(p),
@@ -351,18 +357,29 @@ class SettingsDialog(ProfileMixin, QDialog):
 
     def _apply_cp_profile_to_ui(self, prof: dict) -> None:
         """把自定义 POST 档案套到 UI 控件上。"""
+        sidx = self.cp_api_style.findData(
+            str(prof.get("api_style") or "openai_compat")
+        )
+        self.cp_api_style.setCurrentIndex(sidx if sidx >= 0 else 0)
         self.cp_endpoint.setText(str(prof.get("endpoint") or ""))
+        self.cp_model.setText(str(prof.get("model") or ""))
         self.cp_api_key.setText(str(prof.get("api_key") or ""))
         self.cp_headers_file.setText(str(prof.get("headers_file") or ""))
         li = self.cp_language.findData(str(prof.get("language") or ""))
         self.cp_language.setCurrentIndex(li if li >= 0 else 0)
         self.cp_mock.setChecked(bool(prof.get("mock", True)))
         self.cp_role_separation.setChecked(bool(prof.get("role_separation", False)))
+        try:
+            self.cp_speaker_count.setValue(int(prof.get("speaker_count") or 2))
+        except (TypeError, ValueError):
+            self.cp_speaker_count.setValue(2)
         self.cp_timestamps.setChecked(bool(prof.get("timestamps", True)))
+        self.cp_colloquial_proc.setChecked(bool(prof.get("colloquial_proc", False)))
         try:
             self.cp_max_wait.setValue(int(prof.get("max_wait_seconds") or 300))
         except (TypeError, ValueError):
             self.cp_max_wait.setValue(300)
+        self._on_cp_style_changed()
 
     def _apply_cover_profile_to_ui(self, prof: dict) -> None:
         """把 AI 封面档案套到 UI 控件上。"""
@@ -443,6 +460,36 @@ class SettingsDialog(ProfileMixin, QDialog):
             visible = show_all or (engine == current)
             for w in widgets:
                 w.setVisible(visible)
+
+    def _on_cp_style_changed(self) -> None:
+        """切 API 风格：启用/禁用该风格专属的字段，并刷新端点预览。"""
+        is_ds = self.cp_api_style.currentData() == "dashscope_async"
+        self.cp_model.setEnabled(is_ds)
+        self.cp_speaker_count.setEnabled(is_ds and self.cp_role_separation.isChecked())
+        self.cp_colloquial_proc.setEnabled(is_ds)
+        self.cp_role_separation.setText(
+            "分离说话人（DashScope diarization_enabled / OpenAI 兼容 verbose_json）"
+            if is_ds
+            else "分离说话人（云端 diarization，标注【S1】…）"
+        )
+        self._update_cp_endpoint_preview()
+
+    def _update_cp_endpoint_preview(self) -> None:
+        """实时显示最终请求地址 —— 解决「URL 到底该填到哪一层」的困惑。"""
+        style = self.cp_api_style.currentData() or "openai_compat"
+        base = self.cp_endpoint.text().strip()
+        if not base:
+            self.cp_endpoint_preview.setText("（填 Base URL 后这里会显示最终请求地址）")
+            return
+        try:
+            url = build_stt_endpoint(base, style)
+        except Exception:
+            self.cp_endpoint_preview.setText("（Base URL 格式有问题）")
+            return
+        extra = ""
+        if style == "dashscope_async":
+            extra = "　轮询 {base}/tasks/{task_id}"
+        self.cp_endpoint_preview.setText(f"→ 实际请求：{url}{extra}")
 
     def _on_cover_enable_toggled(self, checked: bool) -> None:
         if self._cover_pipeline_syncing:
@@ -889,6 +936,63 @@ class SettingsDialog(ProfileMixin, QDialog):
             "timestamp_level / stream 五个字段 + language 请求头。"
         )
 
+        self.cp_endpoint = QLineEdit()
+        self.cp_endpoint.setPlaceholderText("只填到 /api/v1 这一层，后面的路径程序自己拼")
+        self.cp_endpoint.setToolTip(
+            "⚠ **只填到 /api/v1 这一层**，后面的路径由程序按「API 风格」自动拼：\n"
+            "  · OpenAI 兼容  → {你填的}/speech_to_text\n"
+            "  · DashScope 异步 → {你填的}/services/audio/asr/transcription\n"
+            "                        轮询 {你填的}/tasks/{task_id}\n\n"
+            "填完整路径也能认出来（会先剥掉再拼），不会拼出 /speech_to_text/speech_to_text。\n\n"
+            "示例：\n"
+            "  MiniMax   https://api.minimax.cn/v1\n"
+            "  阿里云百炼 https://dashscope.aliyuncs.com/api/v1\n"
+            "  业务空间   https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1\n"
+            "  本地服务   http://127.0.0.1:8000/v1\n"
+        )
+        self.cp_endpoint.textChanged.connect(self._update_cp_endpoint_preview)
+
+        # === 2026-10-04 新增：API 风格（两类协议完全不同的服务）===
+        self.cp_api_style = QComboBox()
+        for code, label in API_STYLES.items():
+            self.cp_api_style.addItem(label, code)
+        self.cp_api_style.setToolTip(
+            "同一个框要接两类**协议完全不同**的服务，所以必须显式选风格。\n\n"
+            "OpenAI 兼容（默认）：\n"
+            "  multipart/form-data 上传文件本体 → 一次请求直接返回 text + segments\n"
+            "  上限 500 秒 / 50 MB，超了自动切段\n\n"
+            "DashScope 异步（阿里云百炼 Qwen3-ASR / Paraformer）：\n"
+            "  application/json，**音频必须是公网 URL**（不能上传文件）\n"
+            "  流程：借图床传音频拿 URL → 提交任务 → 轮询 → 下载结果 JSON\n"
+            "  上限 12 小时 / 2 GB，基本不用切段\n"
+            "  ⚠ 填错风格会直接连接被重置（实测 10054）"
+        )
+        self.cp_api_style.currentIndexChanged.connect(self._on_cp_style_changed)
+
+        # 端点实时预览（解决「URL 到底怎么填」）
+        self.cp_endpoint_preview = QLabel("（填 Base URL 后这里会显示最终请求地址）")
+        self.cp_endpoint_preview.setStyleSheet("color: #888; font-size: 11px;")
+        self.cp_endpoint_preview.setWordWrap(True)
+
+        self.cp_model = QLineEdit()
+        self.cp_model.setPlaceholderText("仅 DashScope 异步需要，如 paraformer-v2")
+        self.cp_model.setToolTip(
+            "DashScope 异步必填。官方文档列的模型：\n"
+            "  paraformer-v2                          通用，支持 language_hints + 说话人分离\n"
+            "  qwen3-asr-flash-filetrans               Qwen3，异步\n"
+            "  qwen-audio-3.1-asr-flash-filetrans      Qwen-Audio，异步\n\n"
+            "OpenAI 兼容风格下这个字段被忽略（协议里 model 由程序固定为 asr-1.0）。"
+        )
+
+        self.cp_speaker_count = QSpinBox()
+        self.cp_speaker_count.setRange(2, 100)
+        self.cp_speaker_count.setValue(2)
+        self.cp_speaker_count.setToolTip(
+            "DashScope 说话人数**参考值**（2-100），只在勾了「分离说话人」时生效。\n"
+            "官方明确：它只是提示算法「尽量输出这个人数」，不保证一定输出。\n"
+            "⚠ 开了说话人分离后，官方建议**音频不超过 2 小时**，否则可能失败或超时。"
+        )
+
         self.cp_api_key = QLineEdit()
         self.cp_api_key.setEchoMode(QLineEdit.Password)
         self.cp_api_key.setPlaceholderText(
@@ -932,6 +1036,11 @@ class SettingsDialog(ProfileMixin, QDialog):
             "  人数相同时只能按编号对齐，两人音色接近时可能认错人。\n"
             "⚠ 短素材（不切段）分离最可靠。"
         )
+        # 风格与勾选两条路径共用 _on_cp_style_changed 这一个真源，
+        # 避免「哪些字段该启用」在两处各写一遍、日后各自漂移。
+        self.cp_role_separation.toggled.connect(
+            lambda _checked: self._on_cp_style_changed()
+        )
 
         self.cp_timestamps = QCheckBox("输出时间戳（每段加 [MM:SS] 前缀）")
         self.cp_timestamps.setChecked(True)
@@ -948,15 +1057,29 @@ class SettingsDialog(ProfileMixin, QDialog):
             "500 秒音频约几秒到几十秒返回。切段后每段各用一次。"
         )
 
-        mmform.addRow("接口地址（POST）", self.cp_endpoint)
+        self.cp_colloquial_proc = QCheckBox("口语规整（去掉「嗯/啊/呃」等语气词）")
+        self.cp_colloquial_proc.setToolTip(
+            "仅 DashScope 异步有效（对应它的 disfluency_removal_enabled 参数）。\n"
+            "OpenAI 兼容风格下请用上面的「分离说话人」旁的口语规整，"
+            "或在请求头文件里加对应参数。\n"
+            "课堂实录 / 访谈口癖多，去掉后给下游 LLM 成稿的文本干净很多。"
+        )
+
+        mmform.addRow("API 风格", self.cp_api_style)
+        mmform.addRow("接口地址（只填到 /api/v1）", self.cp_endpoint)
+        mmform.addRow(self.cp_endpoint_preview)
+        mmform.addRow("模型名（DashScope 必填）", self.cp_model)
         mmform.addRow("API Key", self.cp_api_key)
         mmform.addRow("请求头文件", self.cp_headers_row)
         mmform.addRow("语言", self.cp_language)
         mmform.addRow(self.cp_mock)
         mmform.addRow(self.cp_role_separation)
+        mmform.addRow("说话人数（参考值）", self.cp_speaker_count)
         mmform.addRow(self.cp_timestamps)
+        mmform.addRow(self.cp_colloquial_proc)
         mmform.addRow("单请求超时（秒）", self.cp_max_wait)
         outer.addWidget(mm_box)
+        self._on_cp_style_changed()
 
         # === 2026-10-04：自定义 POST 配置档案（机制在 profile_store）===
         cp_prof_box = self._build_profile_box(self._spec("cp"))
@@ -1418,9 +1541,17 @@ class SettingsDialog(ProfileMixin, QDialog):
 
         # 自定义 POST 云端识别（custom_post 引擎，2026-10-02；旧名 minimax_asr 兼容）
         ca = (tr.get("custom_post") or tr.get("minimax_asr") or {})
+        cstyle = str(ca.get("api_style") or "openai_compat")
+        cstyle_idx = self.cp_api_style.findData(cstyle)
+        self.cp_api_style.setCurrentIndex(cstyle_idx if cstyle_idx >= 0 else 0)
         self.cp_endpoint.setText(
             str(ca.get("endpoint") or DEFAULT_ENDPOINT)
         )
+        self.cp_model.setText(str(ca.get("model") or ""))
+        try:
+            self.cp_speaker_count.setValue(int(ca.get("speaker_count") or 2))
+        except (TypeError, ValueError):
+            self.cp_speaker_count.setValue(2)
         self.cp_api_key.setText(str(ca.get("api_key") or ""))
         self.cp_headers_file.setText(str(ca.get("headers_file") or ""))
         clang = str(ca.get("language") or "")
@@ -1429,10 +1560,12 @@ class SettingsDialog(ProfileMixin, QDialog):
         self.cp_mock.setChecked(bool(ca.get("mock", True)))
         self.cp_role_separation.setChecked(bool(ca.get("role_separation", False)))
         self.cp_timestamps.setChecked(bool(ca.get("timestamps", True)))
+        self.cp_colloquial_proc.setChecked(bool(ca.get("colloquial_proc", False)))
         try:
             self.cp_max_wait.setValue(int(ca.get("max_wait_seconds") or 300))
         except (TypeError, ValueError):
             self.cp_max_wait.setValue(300)
+        self._on_cp_style_changed()  # 风格决定哪些字段可用 + 端点预览
         # 2026-10-04：把 custom_post 档案灌进内存，供「应用到当前 / 管理…」用
         tr.setdefault("custom_post", ca)
         self._refresh_profile_combo(self._spec("cp"))
@@ -1533,13 +1666,17 @@ class SettingsDialog(ProfileMixin, QDialog):
 
         # custom_post 当前生效值（2026-10-04）
         cp_updates = {
+            "api_style": self.cp_api_style.currentData() or "openai_compat",
             "endpoint": self.cp_endpoint.text().strip() or DEFAULT_ENDPOINT,
+            "model": self.cp_model.text().strip(),
             "api_key": self.cp_api_key.text().strip(),
             "headers_file": self.cp_headers_file.text().strip(),
             "language": self.cp_language.currentData() or "",
             "mock": self.cp_mock.isChecked(),
             "role_separation": self.cp_role_separation.isChecked(),
+            "speaker_count": self.cp_speaker_count.value(),
             "timestamps": self.cp_timestamps.isChecked(),
+            "colloquial_proc": self.cp_colloquial_proc.isChecked(),
             "max_wait_seconds": self.cp_max_wait.value(),
         }
         # custom_post 档案（2026-10-04）—— 同样是 list，理由见上。

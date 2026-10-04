@@ -727,6 +727,98 @@ def test_engine_focus_ui():
     print("OK 12: 转写 Tab 引擎聚焦（默认只看当前 / 显示全部开关 / 隐藏不丢参数 / 旧名归一）\n")
 
 
+def test_max_tokens_degrade():
+    """各家 max_tokens 上限不同，超了要能自动降级重试。
+
+    实测（2026-10-04，DeepSeek 官方）：合法区间 [1, 393216]，
+    配 520000 → 400 `Invalid max_tokens value`。
+    这个错发生在**请求发出前**，用户只看到「整理版根本没生成」，
+    没有任何指向 max_tokens 的线索 —— 所以必须在调用层兜住。
+    """
+    from video_to_article.providers import llm as L
+    import openai as _openai_mod
+
+    calls = []
+
+    class BoomMaxTokens(Exception):
+        pass
+
+    class Ok:
+        choices = [type("C", (), {"message": type("M", (), {"content": "成稿"})()})()]
+
+    class FakeCompletions:
+        def create(self, **kw):
+            calls.append(kw.get("max_tokens"))
+            if len(calls) == 1:
+                raise BoomMaxTokens("Invalid max_tokens value, the valid range is [1, 393216]")
+            return Ok()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        chat = FakeChat()
+
+    # ⚠ OpenAI 是**函数内** import 的（懒加载，llm.py:76），不是模块级符号，
+    #   所以要 patch openai 模块上的名字，patch llm.OpenAI 会 AttributeError。
+    orig_client = _openai_mod.OpenAI
+    orig_prompt = L.load_prompt
+    _openai_mod.OpenAI = lambda **kw: FakeClient()
+    L.load_prompt = lambda name: "模板 {transcript_text}"
+    try:
+        # ① 撞上限 → 自动降到 _FALLBACK_MAX_TOKENS 并成功
+        out = L.optimize_text_with_llm(
+            "转写稿",
+            {"llm": {"api_key": "k", "base_url": "https://x", "model": "m",
+                      "max_tokens": 520000}},
+            prompt_name="general_article",
+        )
+        assert out == "成稿", out
+        assert calls == [520000, L._FALLBACK_MAX_TOKENS], calls
+
+        # ② 未撞上限时不该多发一次请求
+        calls.clear()
+
+        class OkOnce(FakeCompletions):
+            def create(self, **kw):
+                calls.append(kw.get("max_tokens"))
+                return Ok()
+
+        FakeChat.completions = OkOnce()
+        out2 = L.optimize_text_with_llm(
+            "转写稿",
+            {"llm": {"api_key": "k", "base_url": "https://x", "model": "m",
+                      "max_tokens": 8000}},
+            prompt_name="general_article",
+        )
+        assert out2 == "成稿", out2
+        assert calls == [8000], f"不该重试: {calls}"
+
+        # ③ 错误与 max_tokens 无关时**不能**降级重试
+        #    （否则把鉴权/额度错误也重试一遍，纯浪费）
+        #    实际契约：由外层 except 捕获 → logger.error → 返回 None
+        calls.clear()
+
+        class BoomAuth(FakeCompletions):
+            def create(self, **kw):
+                calls.append(kw.get("max_tokens"))
+                raise RuntimeError("401 Unauthorized")
+
+        FakeChat.completions = BoomAuth()
+        out3 = L.optimize_text_with_llm(
+            "转写稿",
+            {"llm": {"api_key": "k", "base_url": "https://x", "model": "m",
+                      "max_tokens": 520000}},
+            prompt_name="general_article",
+        )
+        assert out3 is None, f"鉴权失败应返回 None 而非硬重试: {out3!r}"
+        assert calls == [520000], f"非 max_tokens 错误不该重试: {calls}"
+    finally:
+        _openai_mod.OpenAI = orig_client
+        L.load_prompt = orig_prompt
+    print("OK 13: max_tokens 超限自动降级重试（非 max_tokens 错误不重试）\n")
+
+
 def main():
     test_resolve_protocol_compat()
     test_vendor()
@@ -740,6 +832,7 @@ def main():
     test_asr_engine_list_shared()
     test_cover_and_host_profiles()
     test_engine_focus_ui()
+    test_max_tokens_degrade()
     print("=" * 50)
     print("ALL llm-settings smoke tests passed ✓")
     print("=" * 50)

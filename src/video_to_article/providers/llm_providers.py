@@ -74,7 +74,9 @@ VENDOR_REGISTRY: Dict[str, Dict[str, str]] = {
     },
     "deepseek": {
         "label": "DeepSeek",
-        "base_url": "https://api.deepseek.com/v1",
+        # 2026-10-04 核对官方 api-docs.deepseek.com：写的是**不带 /v1**。
+        # 旧版文档曾用 /v1，服务端两个都收，但既然新文档明确不带，就跟着改。
+        "base_url": "https://api.deepseek.com",
     },
     "qwen": {
         "label": "阿里通义千问（DashScope）",

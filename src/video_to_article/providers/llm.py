@@ -9,8 +9,18 @@ from .llm_providers import effective_vendor, resolve_protocol
 
 logger = configure_logging()
 
-# 2026-09-12: 剥离推理模型（M3 / DeepSeek-R1 / o1 等）输出开头的 <think>...</think> 思维链块
+# 2026-10-04: max_tokens 被服务端拒绝时的降级目标。
+# 各家上限不同且会变（实测 DeepSeek 为 [1, 393216]），硬编码上限必然过时，
+# 所以只在真的撞到 max_tokens 报错时才降到这个「几乎所有厂商都接受」的值。
+_FALLBACK_MAX_TOKENS = 65536
+
+# 2026-09-12: 剥离推理模型（M3 / Qwen3 等）输出开头的 <think>...</think> 思维链块
 # 规则：只处理开头首个块（含前后空白），不破坏正文
+# ⚠ 2026-10-04 订正：DeepSeek 当前（api-docs.deepseek.com 2026 版）把思维链放在
+#   **独立的 reasoning_content 字段**（流式是 delta.reasoning_content），
+#   OpenAI SDK 会自动分离，**不会混进 content** —— 所以本剥离对 DeepSeek 无害
+#   但也不起作用。它仍需要保留给 MiniMax-M3 / Qwen3 这类把思维链塞进 content 的。
+#   另：DeepSeek 旧名 deepseek-reasoner / R1 已下线，别再按那些名字做判断。
 _THINK_BLOCK_RE = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL)
 
 
@@ -83,13 +93,38 @@ def _optimize_with_openai(text: str, config: dict, prompt_name: str) -> Optional
         return None
     prompt = _render_prompt(prompt_template, text)
 
-    try:
-        response = client.chat.completions.create(
+    want_max = int(config.get("max_tokens", 4000) or 4000)
+
+    def _create(mt: int):
+        return client.chat.completions.create(
             model=config.get("model", "gpt-4o-mini"),
             messages=[{"role": "user", "content": prompt}],
             temperature=config.get("temperature", 0.3),
-            max_tokens=config.get("max_tokens", 4000),
+            max_tokens=mt,
         )
+
+    try:
+        try:
+            response = _create(want_max)
+        except Exception as first_exc:
+            # ⚠ 各家 max_tokens 上限**不一样**，而 GUI 只有一个统一的输入框
+            #   （本 fork 曾把上限拉到 100 万以免长文截断），用户换个厂商就可能
+            #   直接撞上限被拒。实测：DeepSeek 合法区间 [1, 393216]，
+            #   配 520000 → 400 Invalid max_tokens value → 整理版根本不生成，
+            #   而且报错发生在**请求发出前**，用户只会看到「没有产出」。
+            #
+            # 处置：只在错误信息**明确指向 max_tokens** 时降级重试，
+            # 不做无条件重试（避免把真实的鉴权/额度错误也重试一遍）。
+            msg = str(first_exc)
+            if "max_tokens" not in msg:
+                raise
+            safe = _FALLBACK_MAX_TOKENS
+            logger.warning(
+                f"max_tokens={want_max} 被服务端拒绝（各家上限不同，"
+                f"实测 DeepSeek 上限 393216）。自动降到 {safe} 重试一次。"
+            )
+            want_max = safe
+            response = _create(want_max)
 
         if hasattr(response, "choices"):
             optimized_text = response.choices[0].message.content

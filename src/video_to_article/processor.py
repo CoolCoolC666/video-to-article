@@ -538,20 +538,28 @@ def process_video(
 
     if transcript_text is None:
         print("\n步骤 2: 转写音频...")
-        if asr_engine == "funasr":
+        # 2026-10-04 修：判断前先归一旧引擎名。config 里若还留着 "minimax_asr"，
+        # 直接比较会全部落空 → 打印成 "Whisper (base)"，与实际走的引擎完全不符
+        # （user 实测日志：显示 Whisper，实际却在跑 custom_post，排查方向被带偏）。
+        from .gui.asr_engines import normalize_engine
+
+        _engine = normalize_engine(asr_engine)
+        if _engine == "funasr":
             _spk = (config or {}).get("transcribe", {}).get("funasr_speaker")
             print(
                 f"   ASR 引擎: FunASR ({funasr_model})"
                 + ("  + 本地说话人分离 (CAM++)" if _spk else "")
             )
-        elif asr_engine == "qwen_asr":
-            print(f"   ASR 引擎: Qwen3-ASR (来自 qwen_asr 包)")
-        elif asr_engine == "xf_asr":
+        elif _engine == "qwen_asr":
+            print("   ASR 引擎: Qwen3-ASR (来自 qwen_asr 包)")
+        elif _engine == "xf_asr":
             print("   ASR 引擎: 讯飞听见 (xf_asr，云端 API)")
-        elif asr_engine == "minimax_asr":
-            _mm = (config or {}).get("transcribe", {}).get("minimax_asr") or {}
-            _spk = "  + 说话人分离" if _mm.get("role_separation") else ""
-            print(f"   ASR 引擎: MiniMax STT (minimax_asr，云端 API{_spk})")
+        elif _engine == "custom_post":
+            _cp = ((config or {}).get("transcribe", {}).get("custom_post")
+                   or (config or {}).get("transcribe", {}).get("minimax_asr") or {})
+            _spk = "  + 说话人分离" if _cp.get("role_separation") else ""
+            _host = (_cp.get("endpoint") or "").split("//")[-1][:28]
+            print(f"   ASR 引擎: 自定义 POST (custom_post{_spk})\n     端点: {_host}")
         else:
             print(f"   ASR 引擎: Whisper ({model_size})")
         try:

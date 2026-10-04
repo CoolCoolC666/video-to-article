@@ -254,6 +254,17 @@ def load_headers_file(path: Optional[Path] = None) -> Dict[str, str]:
     if headers:
         # 只打印键名，绝不打印值（值里通常是密钥）
         logger.info(f"已从 {target.name} 加载 {len(headers)} 个自定义请求头: {sorted(headers)}")
+        return headers
+
+    # ⚠ 一个 Key: Value 都没解析出来 —— 多半是把**依赖清单 / 需求文档 / 任意文本**
+    #   当成请求头文件填了。逐行 WARNING 之外，再给一条整体提示，
+    #   否则用户会以为「程序读到了，就是没生效」。
+    if target.exists() and target.stat().st_size > 0:
+        logger.warning(
+            f"请求头文件 {target} 里没有解析出任何 Key: Value —— "
+            f"它不是请求头文件（要求每行形如 `Authorization: xxx`）。"
+            f"留空「请求头文件」输入框即可改用程序内默认的 {HEADERS_FILENAME}。"
+        )
     return headers
 
 

@@ -1208,6 +1208,53 @@ def _s3_object_key(file_path: Path, prefix: str = "asr") -> str:
     return f"{prefix.strip('/')}/{stamp}-{digest}{ext}"
 
 
+def _warn_if_credential_shape_off(provider: str, access_key: str, secret_key: str) -> None:
+    """凭据长度/形态明显不对时给中文提示（**不阻断**）。
+
+    Cloudflare R2 官方报错是：
+        InvalidArgument: Credential access key has length 16, should be 32
+    纯英文，且完全看不出「我拿错字段了」—— R2 的 API Token 是**三元组**：
+        Access Key ID     32 位 hex   ← S3 凭据填这个
+        Secret Access Key 64 位 hex   ← 和上面那个配对使用
+        Token value       长 UUID 串  ← 给 Wrangler/CLI 用的，**不是 S3 凭据**
+    最常见的错就是把 Token value 复制进来。
+    """
+    spec = {"r2": (32, 64), "oss": (0, 0)}.get(provider)
+    if not spec:
+        return
+    want_id, want_secret = spec
+    if not want_id:
+        return
+
+    def _is_hex(s: str) -> bool:
+        return bool(s) and all(c in "0123456789abcdefABCDEF" for c in s)
+
+    problems = []
+    if len(access_key) != want_id:
+        problems.append(
+            f"access_key_id 应该是 {want_id} 位，实际 {len(access_key)} 位"
+        )
+    if not _is_hex(access_key):
+        problems.append("access_key_id 含非十六进制字符")
+    if len(secret_key) != want_secret:
+        problems.append(
+            f"access_key_secret 应该是 {want_secret} 位，实际 {len(secret_key)} 位"
+        )
+
+    if not problems:
+        return
+    logger.warning(
+        f"⚠ {provider} 密钥形态看起来不对："
+        + "；".join(problems)
+        + "\n  大概率是把 API Token 里的 **Token value**（长 UUID 串）"
+          "当成了 Access Key ID —— 那个是给 Wrangler/CLI 用的，不是 S3 凭据。\n"
+          f"  R2 后台 → R2 → Manage R2 API Tokens → 创建令牌后页面会同时给出：\n"
+          f"    Access Key ID     {want_id} 位 hex  ← 填进 access_key_id\n"
+          f"    Secret Access Key {want_secret} 位 hex  ← 填进 access_key_secret\n"
+        "  这只是提示，不会拦你；最终以服务端返回为准。"
+    )
+
+
 def upload_to_s3_compatible(file_path: Path, image_host_config: dict, provider: str) -> dict:
     """上传到 Cloudflare R2 或阿里云 OSS，返回公网可读 URL。"""
     defaults = S3_PROVIDER_DEFAULTS.get(provider)
@@ -1241,6 +1288,14 @@ def upload_to_s3_compatible(file_path: Path, image_host_config: dict, provider: 
             f"{provider} 需要 AccessKey。在 config.json 的 image_host 填 "
             f"access_key_id / access_key_secret，或设环境变量 {env_id} / {env_secret}。"
         )
+
+    # === 密钥形态预检（2026-10-04）===
+    # 起因：用户把 R2 的 API Token 片段填了进来，服务端只回一句
+    #   InvalidArgument: Credential access key has length 16, should be 32
+    # —— 英文、看不出是拿错了字段。这里提前用中文说清「你大概填的是 Token value」。
+    # ⚠ 只**提示不阻断**：形态判据是启发式的（厂商可能改规格），
+    #   真被误伤也不该让合法密钥直接用不了。
+    _warn_if_credential_shape_off(provider, access_key, secret_key)
 
     boto3 = import_required("boto3", "boto3")
     # ⚠ boto3/botocore 必须是**懒加载**：它们是可选依赖（只 r2/oss 用得到），

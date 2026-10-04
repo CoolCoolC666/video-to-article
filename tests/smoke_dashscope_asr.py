@@ -616,6 +616,52 @@ def test_host_field_groups_mutually_exclusive():
     print("OK 10: 图床 Tab 两组字段互斥显示（r2/oss 收起 easyimage 组）+ hint 跟随")
 
 
+# ------------------- 11. 密钥形态预检（R2 Token 三元组拿错）
+def test_credential_shape_warning():
+    """R2 的 API Token 是三元组，最容易把 Token value 当成 Access Key ID。
+
+    服务端只回一句英文 `Credential access key has length 16, should be 32`，
+    完全看不出是拿错字段。所以本地要提前用中文点明。
+    ⚠ 关键：只**提示不阻断**——形态判据是启发式的，不能让合法密钥用不了。
+    """
+    from video_to_article.cover import _warn_if_credential_shape_off
+
+    # 正确形态：不该有任何告警
+    good_id = "a" * 32
+    good_secret = "b" * 64
+    # ❌ 断言「不抛异常」+ 不产生 warning 日志
+    logs = []
+    import video_to_article.cover as cover
+    old = cover.logger.warning
+    cover.logger.warning = lambda m: logs.append(str(m))
+    try:
+        _warn_if_credential_shape_off("r2", good_id, good_secret)
+        assert not logs, f"正确密钥不该告警: {logs}"
+
+        # 用户实测的那一形态：16 位 + 非 hex
+        logs.clear()
+        _warn_if_credential_shape_off("r2", "abcdef0123456789", "x" * 53)
+        assert logs, "16 位密钥应告警"
+        msg = logs[0]
+        assert "Token value" in msg, msg
+        assert "32" in msg and "64" in msg, msg
+        # ⚠ 不得打印任何密钥内容
+        assert "abcdef0123456789" not in msg, "告警里绝不能回显密钥"
+
+        # 大小写 hex 也算合法
+        logs.clear()
+        _warn_if_credential_shape_off("r2", "A" * 32, "F" * 64)
+        assert not logs, f"大写 hex 应视为合法: {logs}"
+
+        # OSS 不做长度判据（AWS 兼容各家规格不一）
+        logs.clear()
+        _warn_if_credential_shape_off("oss", "short", "short")
+        assert not logs, "OSS 不该按 R2 的长度判据告警"
+    finally:
+        cover.logger.warning = old
+    print("OK 11: 密钥形态预检（正确密钥不打扰 / 拿错字段中文点明 / 不回显密钥 / OSS 不误报）")
+
+
 def main():
     test_endpoint_building()
     test_submit_body()
@@ -630,6 +676,7 @@ def main():
     test_s3_missing_config_guided()
     test_s3_dispatch_exists()
     test_host_field_groups_mutually_exclusive()
+    test_credential_shape_warning()
     print()
     print("smoke_dashscope_asr: 全部通过 ✓")
 

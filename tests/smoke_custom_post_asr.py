@@ -558,6 +558,44 @@ def test_endpoint_and_headers():
         assert "BadLineWithoutColon" not in got, f"非法行不该进结果: {got!r}"
         print(f"OK 9a: 请求头文件解析（注释/行内注释/空值/非法行）→ {sorted(got)}")
 
+        # === 9a-2: 纯注释模板不该报警（2026-10-04 修的「绕圈提示」）===
+        # 之前判据是「文件非空」，于是程序自动生成的纯注释模板会触发
+        # 「没有解析出任何 Key: Value …留空输入框即可改用默认文件」——
+        # 而默认文件正是它自己，提示绕回原点。这里按「有没有非注释内容」区分。
+        import pathlib as _pl
+
+        def _warnings(fn):
+            recs = []
+            old = cp.logger.warning
+            cp.logger.warning = lambda m: recs.append(str(m))
+            try:
+                fn()
+            finally:
+                cp.logger.warning = old
+            return recs
+
+        def _write(text):
+            f = _pl.Path(tempfile.gettempdir()) / "smoke_hdr_case.txt"
+            f.write_text(text, encoding="utf-8")
+            return f
+
+        t1 = _write("# 只有注释\n# X-Demo: a\n\n# 再一行\n")
+        w1 = _warnings(lambda: cp.load_headers_file(t1))
+        assert not w1, f"纯注释模板不该报警: {w1}"
+        t1.unlink()
+
+        t2 = _write("X-Demo: a\nAuthorization: Bearer k\n")
+        h2 = cp.load_headers_file(t2)
+        assert set(h2) == {"X-Demo", "Authorization"}, h2
+        t2.unlink()
+
+        t3 = _write("yt-dlp>=1.0\nrequests>=2.31\n")
+        w3 = _warnings(lambda: cp.load_headers_file(t3))
+        assert w3, "依赖清单仍应报警（它确实不是请求头文件）"
+        assert any("没有解析出任何" in m for m in w3), w3
+        t3.unlink()
+        print("OK 9a-2: 纯注释模板静默 / 真请求头正常 / 非请求头文件仍报警")
+
         # === 9b: 凭证可以只来自请求头文件（API Key 留空）===
         headers = cp.build_headers("", "zh", got)
         assert headers.get("Authorization") == "Token from-file", (

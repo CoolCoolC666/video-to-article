@@ -247,6 +247,11 @@ def load_headers_file(path: Optional[Path] = None) -> Dict[str, str]:
         return {}
 
     headers: Dict[str, str] = {}
+    # 区分「纯注释模板」与「非请求头文件」：
+    # 程序自动生成的默认模板**本来就只有注释**，解析不出 Key: Value 是正常的，
+    # 再警告一次就变成了「让你留空 → 读默认 → 默认又报警」的绕圈提示。
+    # 只有当文件里**确实有非注释内容**却一个 Key: Value 都解析不出时，才该报警。
+    saw_content = False
     try:
         raw = target.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
@@ -260,11 +265,13 @@ def load_headers_file(path: Optional[Path] = None) -> Dict[str, str]:
         # 去掉行内注释（要求 # 前有空白，避免砍掉 token 里的 #）
         if " #" in line:
             line = line.split(" #", 1)[0].strip()
-        if not line or ":" not in line:
-            if line:
-                logger.warning(
-                    f"请求头文件第 {lineno} 行没有 ':'，已忽略: {line[:60]!r}"
-                )
+        if not line:
+            continue
+        saw_content = True
+        if ":" not in line:
+            logger.warning(
+                f"请求头文件第 {lineno} 行没有 ':'，已忽略: {line[:60]!r}"
+            )
             continue
         key, _, value = line.partition(":")
         key = key.strip()
@@ -286,7 +293,8 @@ def load_headers_file(path: Optional[Path] = None) -> Dict[str, str]:
     # ⚠ 一个 Key: Value 都没解析出来 —— 多半是把**依赖清单 / 需求文档 / 任意文本**
     #   当成请求头文件填了。逐行 WARNING 之外，再给一条整体提示，
     #   否则用户会以为「程序读到了，就是没生效」。
-    if target.exists() and target.stat().st_size > 0:
+    #   纯注释模板（saw_content=False）不算 —— 那正是程序自己生成的样子。
+    if saw_content:
         logger.warning(
             f"请求头文件 {target} 里没有解析出任何 Key: Value —— "
             f"它不是请求头文件（要求每行形如 `Authorization: xxx`）。"

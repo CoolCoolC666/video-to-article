@@ -485,14 +485,46 @@ class SettingsDialog(ProfileMixin, QDialog):
                 w.setVisible(visible)
 
     def _on_host_provider_changed(self) -> None:
-        """provider 打成 r2/oss 时才亮出 S3 字段组。
+        """按 provider 切字段组：**一次只显示该填的那一组**。
 
         保持 host_provider 是自由文本框（档案机制按 .text() 取值，
         改 QComboBox 会牵动 spec/apply/save/load 四处），靠 textChanged
         做识别 —— 用户一敲 r2 就自动切换，不用先去下拉里选。
+
+        ⚠ 两组字段的标签很像但完全不是一回事：
+        easyimage  = API URL + Token（multipart 图床）
+        r2 / oss   = endpoint + bucket + 密钥（S3）
+        平铺在一起时用户会把 endpoint 填进「API URL」，所以必须互斥显示。
         """
-        is_s3 = str(self.host_provider.text() or "").strip().lower() in ("r2", "oss")
+        raw = str(self.host_provider.text() or "").strip().lower()
+        is_s3 = raw in ("r2", "oss")
         self._host_s3_box.setVisible(is_s3)
+        self._host_easy_box.setVisible(not is_s3)
+        if is_s3:
+            self._host_hint.setText(
+                "✅ 当前填**下面这组 S3 字段**（上面「传统图床」那组不用管）：\n"
+                + (
+                    "  · R2  endpoint = https://<AccountID>.r2.cloudflarestorage.com\n"
+                    "    AccountID 在 Cloudflare 后台 R2 页面右侧\n"
+                    "  · OSS endpoint = https://oss-cn-<地域>.aliyuncs.com\n"
+                    "    地域建议与你的百炼同区，如 cn-beijing\n"
+                    "  · ⚠ 别再往「API URL」填 endpoint 了，那是 easyimage 才用的"
+                    if raw == "r2"
+                    else "  · endpoint = https://oss-cn-<地域>.aliyuncs.com"
+                    "（如 cn-beijing，与百炼同区）\n"
+                    "  · ⚠ 别再往「API URL」填 endpoint 了，那是 easyimage 才用的"
+                )
+            )
+        else:
+            self._host_hint.setText(
+                "💡 图床/对象存储的用途：AI 封面出图 + 给 DashScope 异步 ASR 中转音频。\n"
+                "  · 当前 provider=easyimage，填上面「传统图床」那组（API URL + Token）\n"
+                "  · 若要接 Cloudflare R2 / 阿里云 OSS，把 Provider 改成 r2 / oss，\n"
+                "    字段会自动切换成 S3 那组（endpoint / bucket / 密钥）\n"
+                "  · DashScope 硬性要求音频是**公网 URL**，所以桶要外部可读：\n"
+                "    R2 开 Public Development URL，OSS 设 ACL 公共读；\n"
+                "    不想开公读就把「签名有效期」设成 3600，走临时签名直链"
+            )
 
     def _on_cp_style_changed(self) -> None:
         """切 API 风格：启用/禁用该风格专属的字段，并刷新端点预览。"""
@@ -1496,13 +1528,23 @@ class SettingsDialog(ProfileMixin, QDialog):
         self.host_extra.setMaximumHeight(100)
         form.addRow(self.host_enable)
         form.addRow("Provider", self.host_provider)
-        form.addRow("API URL", self.host_api_url)
-        form.addRow("Token", self.host_token)
-        form.addRow("token_field", self.host_token_field)
-        form.addRow("file_field", self.host_file_field)
-        form.addRow("url_json_path", self.host_url_path)
-        form.addRow("timeout_seconds", self.host_timeout)
-        form.addRow("extra_fields (JSON)", self.host_extra)
+
+        # === easyimage 专属字段（2026-10-04 整组收纳）===
+        # ⚠ 切 r2/oss 时必须把这一整组收起来：它们的标签（API URL / Token）
+        # 长得和 S3 的 endpoint / 密钥很像，但**完全不是一回事**。
+        # 之前两套字段平铺在一起，用户会把 endpoint 填进「API URL」——
+        # 那正是本轮用户卡住的直接原因。
+        easy_box = QGroupBox("传统图床（provider = easyimage 时才填）")
+        easy_form = QFormLayout(easy_box)
+        easy_form.addRow("API URL", self.host_api_url)
+        easy_form.addRow("Token", self.host_token)
+        easy_form.addRow("token_field", self.host_token_field)
+        easy_form.addRow("file_field", self.host_file_field)
+        easy_form.addRow("url_json_path", self.host_url_path)
+        easy_form.addRow("timeout_seconds", self.host_timeout)
+        easy_form.addRow("extra_fields (JSON)", self.host_extra)
+        form.addRow(easy_box)
+        self._host_easy_box = easy_box
 
         # === 2026-10-04：S3 兼容对象存储（R2 / OSS）===
         # 用途是给 DashScope 异步 ASR 做音频中转 —— 它不接受文件上传，
@@ -1552,20 +1594,15 @@ class SettingsDialog(ProfileMixin, QDialog):
         s3_form.addRow("签名有效期", self.host_presign)
         form.addRow(s3_box)
         self._host_s3_box = s3_box
-        self.host_provider.textChanged.connect(self._on_host_provider_changed)
-
-        host_tip = QLabel(
-            "💡 图床/对象存储的用途：AI 封面出图 + 给 DashScope 异步 ASR 中转音频。\n"
-            "  · 封面用：传 PNG，拿到 URL 就能生图\n"
-            "  · DashScope 用：它**不接受文件上传**，音频必须先变成公网 URL，\n"
-            "    所以这里既要能传 mp3，也必须能产出**外部可 GET 的直链**\n"
-            "  · 选 r2 / oss 时别忘了让桶**公网可读**（r2 配 public bucket 或 r2.dev 域名，\n"
-            "    oss 把 ACL 设 public-read），否则 DashScope 会拉不到；\n"
-            "    不想开公读就把上面「签名有效期」设成 3600，走临时签名直链。"
-        )
+        # ⚠ hint 必须**先建好再 connect**：textChanged 一触发就会调 handler，
+        #   handler 里要 setText 到它身上，顺序反了直接 AttributeError。
+        host_tip = QLabel()
         host_tip.setWordWrap(True)
         host_tip.setStyleSheet("color: #666; font-size: 11px;")
         form.addRow(host_tip)
+        self._host_hint = host_tip
+        self.host_provider.textChanged.connect(self._on_host_provider_changed)
+        self._on_host_provider_changed()
 
         self.tabs.addTab(_scroll_page(page), "图床")
 

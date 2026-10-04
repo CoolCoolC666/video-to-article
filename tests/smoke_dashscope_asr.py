@@ -569,6 +569,53 @@ def test_s3_dispatch_exists():
     print("OK 9d: r2/oss 分发就位 + boto3 确认为懒加载（不拖累封面功能）")
 
 
+# ------------------- 10. 图床 Tab 字段组互斥（用户实测卡住的地方）
+def test_host_field_groups_mutually_exclusive():
+    """r2/oss 时 easyimage 那组必须收起来，反之亦然。
+
+    本轮用户把 endpoint 填进了「API URL」——因为两套字段平铺在一起，
+    标签（API URL / Token）长得和 S3 的（endpoint / 密钥）很像但不是一回事。
+    一次只显示该填的那组，才不会有人填错。
+    """
+    from video_to_article.gui.settings.settings_dialog import SettingsDialog
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    d = SettingsDialog()
+
+    # ⚠ 用 isHidden() 而不是 isVisible()/isVisibleTo()：
+    #   isVisible 要求**所有祖先**都可见，而这里对话框只构造没 show()；
+    #   isVisibleTo(d) 同理依赖 d 自身 visible。用它们会得到「全都 False」，
+    #   分不清「被代码收起来了」和「祖先没显示」。
+    #   isHidden() 只反映 setVisible(False) 这个动作本身，正是要断言的东西。
+    d.host_provider.setText("easyimage")
+    assert d._host_s3_box.isHidden() is True, "easyimage 不该露出 S3 组"
+    assert d._host_easy_box.isHidden() is False, "easyimage 应显示传统图床组"
+
+    d.host_provider.setText("r2")
+    assert d._host_s3_box.isHidden() is False, "r2 应显示 S3 组"
+    assert d._host_easy_box.isHidden() is True, (
+        "r2 时「API URL / Token」那组必须收起来（否则用户会填错地方）"
+    )
+
+    d.host_provider.setText("oss")
+    assert d._host_s3_box.isHidden() is False, "oss 应显示 S3 组"
+    assert d._host_easy_box.isHidden() is True, "oss 时也应收起 easyimage 组"
+
+    # 大小写/空格要归一（用户手敲很容易带）
+    for v in ("R2", " oss ", "r2"):
+        d.host_provider.setText(v)
+        assert d._host_s3_box.isHidden() is False, f"{v!r} 应识别为 S3"
+
+    # hint 要跟着变，且要明确说「别填 API URL」
+    d.host_provider.setText("r2")
+    assert "API URL" in d._host_hint.text(), d._host_hint.text()
+    d.host_provider.setText("easyimage")
+    assert "easyimage" in d._host_hint.text(), d._host_hint.text()
+    d.close()
+    print("OK 10: 图床 Tab 两组字段互斥显示（r2/oss 收起 easyimage 组）+ hint 跟随")
+
+
 def main():
     test_endpoint_building()
     test_submit_body()
@@ -582,6 +629,7 @@ def main():
     test_s3_object_key_is_ascii()
     test_s3_missing_config_guided()
     test_s3_dispatch_exists()
+    test_host_field_groups_mutually_exclusive()
     print()
     print("smoke_dashscope_asr: 全部通过 ✓")
 

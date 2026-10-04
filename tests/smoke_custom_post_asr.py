@@ -596,6 +596,49 @@ def test_endpoint_and_headers():
         t3.unlink()
         print("OK 9a-2: 纯注释模板静默 / 真请求头正常 / 非请求头文件仍报警")
 
+        # === 9a-3: HTTP 头名合法性（用户第三次把非请求头文件填进来）===
+        # 起因：用户填了文档里的 curl 示例，程序解析出 9 个「头名」：
+        #   '"model"' / '--header "Authorization' / "curl --location 'https"
+        # 然后**真的发出去** → 服务端 ConnectionResetError 10054，
+        # 跟模型名、密钥、音频全都毫无关系，纯属误导。
+        # RFC 7230：头名必须是 token，禁空格/引号/中文/斜杠。
+        f1 = _pl.Path(tempfile.gettempdir()) / "smoke_hdr_curl.txt"
+        f1.write_text(
+            "curl --location 'https://x/api/v1/services/audio/asr/transcription' \\\n"
+            '  --header "Authorization: Bearer sk-x" \\\n'
+            '  --header "Content-Type: application/json" \\\n'
+            '  --data \'{"model": "paraformer-v2"}\'\n',
+            encoding="utf-8",
+        )
+        try:
+            cp.load_headers_file(f1)
+            raise SystemExit("全是非法头名时应该抛错，但没抛")
+        except RuntimeError as e:
+            msg = str(e)
+            assert "没有任何合法请求头" in msg, msg
+            assert "curl" in msg, "应点明多半是文档里的 curl/JSON/Python 示例"
+            assert "10054" in msg, "应说明继续跑会表现为 10054 掐连接（否则用户仍会困惑）"
+            assert "留空" in msg, "应给出可操作动作（把输入框留空）"
+        f1.unlink()
+
+        # 混合：只丢非法的，保留合法的
+        f2 = _pl.Path(tempfile.gettempdir()) / "smoke_hdr_mixed.txt"
+        f2.write_text('X-Real: 1\n"model": 2\n--header "X-Bad: 3\n', encoding="utf-8")
+        h_mixed = cp.load_headers_file(f2)
+        assert set(h_mixed) == {"X-Real"}, h_mixed
+        f2.unlink()
+
+        # 头名校验函数本身的边界
+        # ⚠ '-' 是 RFC 7230 tchar 的合法成员，所以 '--header' **本身**合法；
+        #   真正让 curl 示例被拦的是它后面还跟着空格/引号（'--header "X-Tok'）。
+        for ok in ("Authorization", "X-Deploy-Token", "x_1", "a!#$%&'*+-.^_`|~",
+                   "--header"):
+            assert cp._is_valid_http_header_name(ok), f"{ok!r} 应算合法头名"
+        for bad in ('"model"', '--header "Authorization', "curl --location",
+                    "中文头", "a b", "a/b", "a:b", ""):
+            assert not cp._is_valid_http_header_name(bad), f"{bad!r} 不该算合法头名"
+        print("OK 9a-3: 非法 HTTP 头名被拦（curl/JSON 示例不再 10054）+ 混合时只丢非法的")
+
         # === 9b: 凭证可以只来自请求头文件（API Key 留空）===
         headers = cp.build_headers("", "zh", got)
         assert headers.get("Authorization") == "Token from-file", (

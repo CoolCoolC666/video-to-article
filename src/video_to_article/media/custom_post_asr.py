@@ -231,6 +231,28 @@ def write_headers_template(path: Optional[Path] = None, overwrite: bool = False)
     return target
 
 
+# === HTTP 头名合法性（RFC 7230 token）===
+# ⚠ 用户已经三次把「不是请求头的东西」填进请求头文件：
+#   ① requirements.txt 的依赖清单  ② DashScope 的 Python 示例  ③ 文档里的 curl 示例
+# 第③次里程序解析出的"头名"是 '"model"' / '--header "Authorization' /
+#   "curl --location 'https" —— 带引号、空格、整条命令，然后**真的发出去**，
+#   服务器直接 ConnectionResetError 10054，跟模型、密钥都毫无关系。
+# 所以这里按 HTTP 规范校验：头名只能是 token（字母数字 + !#$%&'*+-.^_`|~），
+# 出现空格/引号/中文/斜杠一律不是头名。
+_HTTP_TOKEN_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789"
+    "!#$%&'*+-.^_`|~"
+)
+
+
+def _is_valid_http_header_name(name: str) -> bool:
+    """头名是否合法 HTTP token。中文头名在实践中也不被支持，一并拒。"""
+    n = str(name or "")
+    return bool(n) and all(ch in _HTTP_TOKEN_CHARS for ch in n)
+
+
 def load_headers_file(path: Optional[Path] = None) -> Dict[str, str]:
     """读请求头文件 → dict。文件不存在就生成模板并返回空 dict。
 
@@ -247,6 +269,8 @@ def load_headers_file(path: Optional[Path] = None) -> Dict[str, str]:
         return {}
 
     headers: Dict[str, str] = {}
+    # 收集「有 Key: Value 但键名不是合法 HTTP 头名」的项（curl/JSON/Python 示例）
+    bad_names: List[Tuple[int, str]] = []
     # 区分「纯注释模板」与「非请求头文件」：
     # 程序自动生成的默认模板**本来就只有注释**，解析不出 Key: Value 是正常的，
     # 再警告一次就变成了「让你留空 → 读默认 → 默认又报警」的绕圈提示。
@@ -278,12 +302,50 @@ def load_headers_file(path: Optional[Path] = None) -> Dict[str, str]:
         value = value.strip()
         if not key:
             continue
+        # ⚠ 头名必须是 HTTP token。带引号/空格/中文/斜杠的（多半来自
+        #   curl 示例、JSON、Python 代码）不是头名，**发出去服务端会直接掐连接**
+        #   报一个毫无线索的 ConnectionResetError 10054。
+        if not _is_valid_http_header_name(key):
+            bad_names.append((lineno, key))
+            continue
         # 同名（忽略大小写）后写的覆盖
         for existing in list(headers):
             if existing.lower() == key.lower() and existing != key:
                 headers[key] = headers.pop(existing)
                 break
         headers[key] = value
+
+    if bad_names:
+        sample = ", ".join(repr(k) for _, k in bad_names[:3])
+        more = f" 等 {len(bad_names)} 个" if len(bad_names) > 3 else ""
+        logger.warning(
+            f"请求头文件第 "
+            + "、".join(str(n) for n, _ in bad_names[:5])
+            + ("…" if len(bad_names) > 5 else "")
+            + f" 行的「键名」不是合法 HTTP 头名，已全部忽略: {sample}{more}\n"
+            "  （HTTP 头名不能含空格 / 引号 / 中文 / 斜杠）\n"
+            "  看到这种形态，通常是**把文档里的 curl 示例或 JSON 片段填进来了**。\n"
+            "  请求头文件每行只能是 `X-Header-Name: value` 这种形式。"
+        )
+
+    # ⚠ 一个合法头都没解析出来，但文件里**确实有**非注释内容 →
+    #   说明整个文件都不是请求头。此时必须**明确失败**：
+    #   静默继续的话，这些垃圾头会被真的发出去，服务端掐连接，
+    #   用户看到的是 ConnectionResetError 10054 —— 与真实原因毫无关联。
+    if not headers and bad_names:
+        raise RuntimeError(
+            f"请求头文件 {target} 里没有任何合法请求头"
+            f"（解析出 {len(bad_names)} 个键名，但全都不是合法 HTTP 头名）。\n\n"
+            "这个文件很可能是**文档里的 curl / JSON / Python 示例**，"
+            "不是请求头文件。\n"
+            "「请求头文件」输入框只接受每行形如：\n"
+            "    X-Deploy-Token: your-token-here\n"
+            "    Authorization: Bearer sk-xxx\n"
+            "\n处理办法：把「请求头文件」输入框**留空**（用程序内默认的 "
+            f"{HEADERS_FILENAME}），或改成真正的请求头内容。\n"
+            "⚠ 继续运行会把这些垃圾头发给服务端，表现为毫无线索的"
+            "「远程主机强迫关闭了一个现有的连接」(10054)。"
+        )
 
     if headers:
         # 只打印键名，绝不打印值（值里通常是密钥）

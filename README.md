@@ -578,9 +578,9 @@ for key, value in updates.items():
 
 ### 测试 / 工程
 
-- **14 个 smoke 脚本在 `tests/`**（`smoke_settings / fallback / language / jp_kr / release / cleanup / thinking / xf_asr / xf_e2e / funasr_speaker / custom_post_asr / dashscope_asr / llm_settings / bilibili_parse`）
-  - 验证 GUI 字段读写、device fallback、language 兜底、释放按钮、清理按钮、xf_asr 鉴权签名 / upload 协议 / poll 状态码 / orderResult 解析 / 说话人分离 / 增强参数降级、FunASR CAM++ 模型解析 / sentence_info 格式化 / 富标签剥离、custom_post 协议契约 / 切段阈值 / 跨段偏移 / 错误码 / 端点可配 / 请求头文件解析 / 旧名兼容 / 五处注册点、**DashScope 提交体 / URL 编码 / 轮询状态机 / subtask_status / 毫秒转秒**、LLM 档案、av↔BV 互转
-  - 14 套全过，共 140+ 断言
+- **14 个 smoke 脚本在 `tests/`**（`smoke_settings / fallback / language / jp_kr / release / cleanup / thinking / xf_asr / xf_e2e / funasr_speaker / custom_post_asr / dashscope_asr / llm_settings / bilibili_parse / mcp_tools`）
+  - 验证 GUI 字段读写、device fallback、language 兜底、释放按钮、清理按钮、xf_asr 鉴权签名 / upload 协议 / poll 状态码 / orderResult 解析 / 说话人分离 / 增强参数降级、FunASR CAM++ 模型解析 / sentence_info 格式化 / 富标签剥离、custom_post 协议契约 / 切段阈值 / 跨段偏移 / 错误码 / 端点可配 / 请求头文件解析 / 旧名兼容 / 五处注册点、**DashScope 提交体 / URL 编码 / 轮询状态机 / subtask_status / 毫秒转秒 / 同步模型拦截 / 主入口 duration**、LLM 档案、av↔BV 互转、**MCP 工具脱敏与档案隔离**
+  - 15 套全过，共 190+ 断言
   - `tests/README.md` 说明运行方式（从仓库根跑）
 - **`.gitignore` 加严**：
   - 新增 `pip-unpack-*/` `run_e2e_main.log` `__tmp_*` `*.bak` `config.json.bak*`

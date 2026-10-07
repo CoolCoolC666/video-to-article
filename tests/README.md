@@ -63,3 +63,4 @@ Get-ChildItem tests\smoke_*.py | ForEach-Object {
 | `smoke_dashscope_asr.py` | **DashScope 异步**（2026-10-04 新增，28 组）：端点拼接、提交体字段、**中文/空格 URL 编码**、`parameters` 条件分支（`language_hints` 只 paraformer / 人数越界不下发）、轮询状态机（GET）、**整体 SUCCEEDED 但子任务 FAILED 会被拦住**、内联结果兜底、超时、官方 `transcripts[].sentences[]` 归一 + **毫秒转秒**、分风格切段阈值、**占位域名识别（9 个占位 + 7 个真地址双向，防误杀）**、**S3 object key 恒为 ASCII**、R2/OSS 缺配置一次列全、**boto3 确认懒加载（不拖累封面）** |
 | `smoke_llm_settings.py` | LLM 多档案 + 模型自动发现：协议/厂商两行对齐、Model 可编辑下拉 + ⟳ 抓取、档案增删改、档案隔离 |
 | `smoke_bilibili_parse.py` | B 站引用解析（2026-10-03 新增）：严格语法、**av↔BV 本地互转**（锚点 `av170001 ↔ BV17x411w7KC`）、优先级与消费区间、b23 短链展开、av 形式 URL 取字幕 |
+| `smoke_mcp_tools.py` | **批量转写 MCP 工具**（2026-10-07，P0）：**密钥全部脱敏（含档案列表）**、**档案激活只在内存副本（原 config 一字未改）**、overrides 仅本次生效、引擎并发规则 / DashScope 模型清单 / 模型名取对字段、跑前警告（max_tokens 超限 / 同步模型打异步端点 / 图床不可公网读 / source 选错） |

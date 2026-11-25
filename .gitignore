@@ -30,6 +30,8 @@ src/*.egg-info/
 
 # 本地文档不入库（含操作备忘，仅本机保留）
 docs/
+# 本机安装备忘（含本机绝对路径与磁盘用量，仅本机保留）
+INSTALL_LOG.md
 
 # 项目配置和数据（含密钥 / 用户数据）
 config.json
@@ -83,6 +85,8 @@ run_e2e_main.log
 
 # 临时调试文件（__tmp_*）和备份文件
 __tmp_*
+# tests/ 下的一次性调试脚本与探针（smoke_* 是有效测试代码，**不**忽略）
+tests/_scratch_*
 *.bak
 config.json.bak*
 # 一次性 fork 改造脚本（个人用，不入公共 fork）

@@ -16,8 +16,7 @@
 **MCode**（原生支持 Streamable HTTP）：
 
 ```powershell
-cd E:\000~\YilanChengWen-src
-.venv\Scripts\python.exe -m video_to_article.mcp_tools.server
+.\run_mcp_server.ps1
 ```
 
 MCP 配置：

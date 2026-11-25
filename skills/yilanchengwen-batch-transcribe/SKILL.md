@@ -1,6 +1,9 @@
 ---
 name: yilanchengwen-batch-transcribe
 description: 一览成文（video-to-article）批量转写的 MCP 工具用法。当用户要批量转写视频/音频、查看还剩多少没处理、重新生成整理版文章、或排查转写与成稿失败时使用。
+version: 0.1.0
+created: 2026-11-25
+based_on: YilanChengWen（CoolCoolC666/video-to-article fork）
 ---
 
 # 一览成文 · 批量转写
@@ -16,11 +19,13 @@ MCP 工具补的是**让 Agent 能驱动**这件事，不是重新实现批量�
 ## 服务怎么起
 
 ```powershell
-cd <项目根>
-.venv\Scripts\python.exe -m video_to_article.mcp_tools.server
+.\run_mcp_server.ps1
 ```
 
+（等价手动命令：`.venv\Scripts\python.exe -m video_to_article.mcp_tools.server`）
+
 端点 `http://127.0.0.1:8000/mcp`（**无尾斜杠**）。默认只监听本机。
+关掉那个窗口就等于停服 —— MCP 是只读工具，停服不影响 CLI 正常批量跑。
 
 ## 四个工具（当前阶段全部只读）
 

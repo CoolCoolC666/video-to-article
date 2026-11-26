@@ -15,12 +15,19 @@
 #   -WithModels        bundle models/ (very large)
 #   -SkipZip           skip versioned zip
 #   -SkipReleaseDir    only zip, do not copy full versioned folder (~1GB)
+#   -Slim              slim build: drop the local ASR stack (torch/transformers/...),
+#                      keep the cloud path only. ~1GB instead of ~4GB, and it builds
+#                      an order of magnitude faster
+#   -Demo              classroom demo pack: write a demo config.json (only the keys
+#                      the demo needs, local absolute paths cleared) + quick-start note
 
 param(
     [switch]$SkipInstall,
     [switch]$WithModels,
     [switch]$SkipZip,
-    [switch]$SkipReleaseDir
+    [switch]$SkipReleaseDir,
+    [switch]$Slim,
+    [switch]$Demo
 )
 
 $ErrorActionPreference = "Stop"
@@ -60,6 +67,8 @@ if (Test-Path $OutDir) {
 }
 
 Write-Host "==> PyInstaller onedir (may take a long time)"
+# -Slim: the spec reads this and excludes the local ASR stack (torch & friends)
+$env:YLANS_SLIM = if ($Slim) { "1" } else { "" }
 & $Py -m PyInstaller --noconfirm --clean --distpath $DistRoot --workpath $Build $Spec
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller failed with exit code $LASTEXITCODE"
@@ -71,11 +80,14 @@ if (-not (Test-Path $ExePath)) {
 }
 
 # FunASR imports package data version.txt; fail fast if PyInstaller dropped it
-$funasrVersion = Join-Path $OutDir "_internal\funasr\version.txt"
-if (-not (Test-Path -LiteralPath $funasrVersion)) {
-    throw "Missing bundled FunASR data: $funasrVersion (check packaging/*.spec collect_data_files('funasr'))"
+# A slim build ships no funasr at all, so this check does not apply there.
+if (-not $Slim) {
+    $funasrVersion = Join-Path $OutDir "_internal\funasr\version.txt"
+    if (-not (Test-Path -LiteralPath $funasrVersion)) {
+        throw "Missing bundled FunASR data: $funasrVersion (check packaging/*.spec collect_data_files('funasr'))"
+    }
+    Write-Host "    FunASR version.txt OK: $funasrVersion"
 }
-Write-Host "    FunASR version.txt OK: $funasrVersion"
 
 Write-Host "==> Assembling runtime files next to exe"
 $exSrc = Join-Path $Root "config.example.json"
@@ -105,6 +117,19 @@ $ex = Join-Path $OutDir "config.example.json"
 if ((-not (Test-Path $cfg)) -and (Test-Path $ex)) {
     Copy-Item $ex $cfg -Force
     Write-Host "    created config.json from example (fill API keys before use)"
+}
+
+if ($Demo) {
+    # Classroom demo config: keep only the keys the demo path needs and clear
+    # this machine's absolute paths (they do not exist on the classroom PC).
+    # The Chinese quick-start filename is written by Python on purpose --
+    # PowerShell 5.1 corrupts Chinese literals inside .ps1 files.
+    Write-Host "==> Writing demo config (keys masked / local paths cleared)"
+    & $Py (Join-Path $Root "packaging\make_demo_config.py") --config (Join-Path $Root "config.json") --out $OutDir --quickstart (Join-Path $Root "packaging\demo_README.txt")
+    if ($LASTEXITCODE -ne 0) {
+        throw "make_demo_config.py failed"
+    }
+    Write-Host "    demo config + quick-start note OK"
 }
 
 if ($WithModels) {

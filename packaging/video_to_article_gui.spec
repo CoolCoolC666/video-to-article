@@ -7,12 +7,21 @@
 # - models/ are NOT bundled here (too large); assemble step may copy optionally.
 # - First full build can take a long time and produce multi-GB folders.
 
+import os
 import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
+
+# 精简版（YLANS_SLIM=1）：只保留云端链路，砍掉本地 ASR 栈。
+# 这几个包在 src/ 里全是**函数内延迟导入**（media/qwen_asr.py、media/audio.py），
+# GUI 启动与云端转写都不需要它们 —— 但 PyInstaller 会照 import 图把 torch
+# 整棵拖进来（约 2.5 GB）。课堂演示包不带本地引擎 → 排除掉。
+SLIM = os.environ.get("YLANS_SLIM", "").strip().lower() in ("1", "true", "yes")
+HEAVY = ["torch", "transformers", "qwen_asr", "funasr", "faster_whisper",
+         "modelscope", "anthropic", "opencc"]
 
 # Spec may be analyzed with cwd = project root or packaging/
 SPECDIR = Path(SPEC).resolve().parent if "SPEC" in dir() else Path(".").resolve()
@@ -33,7 +42,12 @@ datas = [
 
 # funasr 在 import 时读取包内 version.txt（非 .py），必须打进 onedir
 # collect_data_files 会收集 funasr 下所有数据文件（目前主要是 version.txt）
-datas += collect_data_files("funasr")
+# ⚠ fork 已改用 qwen_asr，funasr 未必装了 —— 收集失败不能让整个构建挂掉
+if not SLIM:
+    try:
+        datas += collect_data_files("funasr")
+    except Exception:
+        pass
 
 hiddenimports = [
     "PySide6.QtCore",
@@ -77,10 +91,14 @@ hiddenimports = [
     "faster_whisper",
 ]
 # 确保 funasr 子模块被分析到（与 datas 互补）
-try:
-    hiddenimports += collect_submodules("funasr")
-except Exception:
-    pass
+if not SLIM:
+    try:
+        hiddenimports += collect_submodules("funasr")
+    except Exception:
+        pass
+
+if SLIM:
+    hiddenimports = [h for h in hiddenimports if h.split(".")[0] not in HEAVY]
 
 _icon = str(ROOT / "packaging" / "app.ico")
 
@@ -99,7 +117,7 @@ a = Analysis(
         "notebook",
         "IPython",
         "pytest",
-    ],
+    ] + (HEAVY if SLIM else []),
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

@@ -11,9 +11,13 @@ import sys
 import zipfile
 from pathlib import Path
 
-# Skip noisy/runtime-only paths when packaging green zip
-SKIP_DIR_NAMES = {"logs", "__pycache__"}
+# Skip noisy/runtime-only paths when packaging green zip.
+# "logs" only counts at the app root: vendor packages ship their own data/logs
+# (e.g. botocore's CloudWatch Logs models) and dropping them breaks folder/zip parity.
+SKIP_ROOT_DIRS = {"logs"}
+SKIP_ANY_DIRS = {"__pycache__"}
 SKIP_SUFFIXES = {".log", ".pyc", ".part", ".ytdl", ".tmp"}
+SKIP_NAMES = {"custom_post_headers.txt"}  # runtime file holding auth headers
 
 
 def main() -> int:
@@ -36,7 +40,9 @@ def main() -> int:
             if not path.is_file():
                 continue
             rel_parts = path.relative_to(src).parts
-            if any(p in SKIP_DIR_NAMES for p in rel_parts):
+            if rel_parts[0] in SKIP_ROOT_DIRS or path.name in SKIP_NAMES:
+                continue
+            if any(p in SKIP_ANY_DIRS for p in rel_parts):
                 continue
             if path.suffix.lower() in SKIP_SUFFIXES:
                 continue

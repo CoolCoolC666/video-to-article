@@ -75,6 +75,10 @@ hiddenimports = [
     "openai",
     "anthropic",
     "requests",
+    # boto3 是 import_required("boto3") 懒加载的 —— PyInstaller 静态分析看不见
+    # __import__(name) 这种动态导入，不显式列出就不会进包。漏掉的表现是
+    # 「打包后跑 R2/OSS 上传才报 缺少依赖 boto3」，在客户机上才炸。
+    "boto3",
     "PIL",
     "opencc",
     # ASR stack (may pull torch — large)

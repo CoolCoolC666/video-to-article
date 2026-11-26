@@ -89,6 +89,15 @@ if (-not $Slim) {
     Write-Host "    FunASR version.txt OK: $funasrVersion"
 }
 
+# boto3 is loaded via import_required("boto3") -> PyInstaller's static analysis
+# cannot see it. Without this the R2/OSS upload dies on the customer machine with
+# "missing dependency boto3" -- fail here instead.
+$boto3Dir = Join-Path $OutDir "_internal\boto3"
+if (-not (Test-Path -LiteralPath $boto3Dir)) {
+    throw "Missing bundled boto3: $boto3Dir (add 'boto3' to hiddenimports in packaging/*.spec)"
+}
+Write-Host "    boto3 OK: $boto3Dir"
+
 Write-Host "==> Assembling runtime files next to exe"
 $exSrc = Join-Path $Root "config.example.json"
 if (Test-Path $exSrc) {

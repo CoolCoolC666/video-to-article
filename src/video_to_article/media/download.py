@@ -203,6 +203,40 @@ def _find_in_dirs(dirs: list[Path], stem: str, exts: list[str]) -> Optional[str]
     return None
 
 
+def _find_by_video_id(dirs: list[Path], video_id: str, exts: list[str]) -> Optional[str]:
+    """按视频 ID 兜底查找。
+
+    文件名里始终带 ID（_media_stem 拼的是「标题_ID」），而标题可能在
+    「字幕阶段」与「下载完成」两次取到的不一致 —— 这时按标题找必然落空，
+    按 ID 找一定能命中。
+    """
+    if not video_id:
+        return None
+    wanted = {e.lstrip(".").lower() for e in exts}
+    for d in dirs:
+        try:
+            matches = sorted(Path(d).glob(f"*{video_id}.*"))
+        except OSError:
+            continue
+        for path in matches:
+            if path.suffix.lower().lstrip(".") in wanted:
+                return str(path)
+    return None
+
+
+def _dir_listing(d: Path, limit: int = 8) -> str:
+    """目录里到底有什么 —— 排查「文件在却找不到」时最关键的一行信息。"""
+    try:
+        names = sorted(p.name for p in Path(d).glob("*") if p.is_file())
+    except OSError as e:
+        return f"<读取失败: {e}>"
+    if not names:
+        return "(空)"
+    head = names[:limit]
+    more = f" 等 {len(names)} 个" if len(names) > limit else ""
+    return f"{len(names)} 个文件: " + ", ".join(head) + more
+
+
 def _media_id_stem(metadata: Optional[dict] = None, info: Optional[dict] = None) -> str:
     """Legacy / lookup stem: bare platform video id."""
     video_id = (metadata or {}).get("id") or (info or {}).get("id")
@@ -712,6 +746,12 @@ def download_media(
     # Recompute stem after info/metadata merge (title may arrive late).
     stem = _media_stem(meta, info or None)
     lookup_stems = _media_lookup_stems(meta, info or None)
+    # ⚠ 关键：文件是**用 out_stem 写进磁盘**的，所以 out_stem 必须进候选。
+    #   标题在「字幕阶段」与「下载后」两次可能不同（字幕阶段走 Bilibili API，
+    #   下载后走 yt-dlp），一旦不同，按新标题找必然落空 —— 文件在磁盘上却认不出来。
+    if out_stem and out_stem not in lookup_stems:
+        lookup_stems.append(out_stem)
+    video_id = str(meta.get("id") or (info or {}).get("id") or "")
     search_audio_dirs = [audio_dir] + [d for d in audio_search if d != audio_dir]
     search_video_dirs = [video_dir] + [d for d in video_search if d != video_dir]
 
@@ -722,6 +762,10 @@ def download_media(
                 audio_path = _find_in_dirs(search_audio_dirs, s, AUDIO_EXTS)
                 if audio_path:
                     break
+            if not audio_path:
+                audio_path = _find_by_video_id(search_audio_dirs, video_id, AUDIO_EXTS)
+                if audio_path:
+                    logger.warning("音频文件名与预期不一致，已按视频 ID 找到: %s", audio_path)
         else:
             # FFmpegExtractAudio leaves mp3 in video_dir when keepvideo=True
             found = None
@@ -756,6 +800,10 @@ def download_media(
             video_path = _find_in_dirs(search_video_dirs, s, VIDEO_EXTS)
             if video_path:
                 break
+        if not video_path:
+            video_path = _find_by_video_id(search_video_dirs, video_id, VIDEO_EXTS)
+            if video_path:
+                logger.warning("视频文件名与预期不一致，已按视频 ID 找到: %s", video_path)
         # Optionally rename bare-id file to title_id for consistency
         if video_path and stem:
             vp = Path(video_path)
@@ -867,9 +915,17 @@ def download_media(
 
     title = str(meta.get("title") or (info or {}).get("title") or "未知标题")
     if need_audio and not audio_path:
-        raise RuntimeError(f"音频文件未找到（下载可能已完成但扩展名不匹配）: {audio_dir}")
+        raise RuntimeError(
+            f"音频文件未找到（下载可能已完成但扩展名不匹配）: {audio_dir}\n"
+            f"   该目录现有文件: {_dir_listing(audio_dir)}\n"
+            f"   尝试过的文件名: {lookup_stems}"
+        )
     if need_video and not video_path:
-        raise RuntimeError(f"视频文件未找到（下载可能已完成但扩展名不匹配）: {video_dir}")
+        raise RuntimeError(
+            f"视频文件未找到（下载可能已完成但扩展名不匹配）: {video_dir}\n"
+            f"   该目录现有文件: {_dir_listing(video_dir)}\n"
+            f"   尝试过的文件名: {lookup_stems}"
+        )
     if not need_media and download_subs and not subtitle_paths:
         raise RuntimeError("字幕下载失败：未找到可用字幕文件（可检查 cookies / 语言 / 平台支持）")
 

@@ -13,6 +13,10 @@
        上传音频 → 云端转写 → 生成文章
   4. 完成后看 output\ 目录下的 general_article.md
 
+【命令行模式（没有图形界面时也能跑）】
+  YilanChengWen.exe --cli --url <视频链接> --prompts general_article
+  输出同时写进 logs\cli_run.log（窗口版程序本身不带控制台）
+
 【包里已经配好的】
   · 转写：阿里云百炼 DashScope 异步（qwen-audio-3.1-asr-flash-filetrans）
   · 成稿：云端大模型（MiniMax-M3.1-Flash）
@@ -22,11 +26,14 @@
   · 没有本地语音模型（torch / FunASR / Whisper 那条路被裁掉了）
       → 「设置 → 转写 → 默认 ASR 引擎」保持「自定义 POST」，不要改
   · 没有视频下载用的 cookies
-      → YouTube 链接可能下不动；B 站 / 本地视频没问题
+      → B 站 AI 字幕取不到（会自动回退到「下载音频再转写」，演示不受影响）；
+        YouTube 链接可能下不动
 
 【出问题了看哪里】
-  · logs\app.log —— 所有日志都在这
+  · logs\app.log —— 主日志
+  · logs\cli_run.log —— 命令行模式的完整输出
   · 常见报错对应关系：
+      「音频文件未找到」→ 报错信息里会列出该目录现有文件，照着核对
       「该端点拒绝了当前凭证 / Free quota exhausted」
           → 服务商额度用完了，换服务商或等额度恢复
       「模型 ... 不支持异步调用」

@@ -92,8 +92,8 @@ MCP 工具补的是**让 Agent 能驱动**这件事，不是重新实现批量�
 - **只认 `-filetrans` 结尾的模型名**。`qwen3-asr-flash`（同步模型）打异步端点
   会报 `current user api does not support asynchronous calls`，
   错误里完全看不出是模型名问题。可用：
-  `qwen-audio-3.0-asr-flash-filetrans` / `qwen3-asr-flash-filetrans` /
-  `fun-asr` / `paraformer-v2`
+  `qwen-audio-3.1-asr-flash-filetrans` / `qwen-audio-3.0-asr-flash-filetrans` /
+  `qwen3-asr-flash-filetrans` / `fun-asr` / `paraformer-v2`
 - **音频必须是公网 URL**，程序不接受文件上传 → 借图床（R2 / OSS）换 URL
 - **图床桶必须外部可读**，否则任务 `FILE_DOWNLOAD_FAILED`
   （R2 配 Public Development URL，OSS 设 ACL 公共读，

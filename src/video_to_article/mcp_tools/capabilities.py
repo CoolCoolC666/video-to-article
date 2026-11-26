@@ -110,6 +110,9 @@ ENGINE_CAPS: Dict[str, Dict[str, Any]] = {
 
 # DashScope 异步风格下真正可用的模型（官方会更新版本号，以服务商文档为准）
 DASHSCOPE_ASYNC_MODELS = [
+    # 3.1 与 3.0 都是官方异步模型名；3.1 在自有部署上实测能提交（2026-11-25），
+    # 3.0 当时报的是 free quota exhausted（额度问题，不是模型名问题）。
+    "qwen-audio-3.1-asr-flash-filetrans",
     "qwen-audio-3.0-asr-flash-filetrans",
     "qwen3-asr-flash-filetrans",
     "fun-asr",
